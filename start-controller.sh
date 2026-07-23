@@ -11,7 +11,8 @@ if [[ "$BROWSERCTL_HOST" != 127.0.0.1 && "$BROWSERCTL_HOST" != localhost && "$BR
   exit 2
 fi
 
-exec env npm_config_cache="$BROWSERCTL_NPM_CACHE" \
+exec env PLAYWRIGHT_MCP_PING_TIMEOUT_MS=0 \
+  npm_config_cache="$BROWSERCTL_NPM_CACHE" \
   npx -y @playwright/mcp@0.0.78 \
   --cdp-endpoint "$BROWSERCTL_CDP_ENDPOINT" \
   --shared-browser-context \
