@@ -23,6 +23,7 @@ def run_fake_server(state_dir, port_file, event_file, mode="healthy"):
     class FakeMCP(BaseHTTPRequestHandler):
         delete_status = 200
         active = 0
+        selected_tabs = {}
         mutex = threading.Lock()
 
         def log_message(self, *_):
@@ -39,7 +40,11 @@ def run_fake_server(state_dir, port_file, event_file, mode="healthy"):
             message = json.loads(body)
             method = message["method"]
             name = message.get("params", {}).get("name")
-            self.event("post", method=method, name=name)
+            arguments = message.get("params", {}).get("arguments", {})
+            session = self.headers.get("Mcp-Session-Id")
+            self.event(
+                "post", method=method, name=name, session=session,
+                request_id=message.get("id"))
             if method == "notifications/initialized":
                 payload, status = b"accepted", 202
             elif method == "initialize":
@@ -50,7 +55,12 @@ def run_fake_server(state_dir, port_file, event_file, mode="healthy"):
                 with self.mutex:
                     type(self).active += 1
                     active = type(self).active
-                self.event("operation_start", method=method, name=name, active=active)
+                lease = json.loads(
+                    (Path(state_dir) / "lease.json").read_text(
+                        encoding="utf-8"))
+                self.event(
+                    "operation_start", method=method, name=name, active=active,
+                    in_flight_id=lease.get("in_flight", {}).get("id"))
                 if method == "tools/call":
                     if name == "slow":
                         time.sleep(0.35)
@@ -64,6 +74,25 @@ def run_fake_server(state_dir, port_file, event_file, mode="healthy"):
                     result = {"content": [{"type": "text"}]}
                 elif method == "tools/call" and name == "unknown_content_type":
                     result = {"content": [{"type": "bogus"}]}
+                elif (method == "tools/call" and name == "browser_tabs"
+                      and arguments.get("action") == "select"):
+                    type(self).selected_tabs[session] = arguments.get("index")
+                    result = {
+                        "content": [{
+                            "type": "text",
+                            "text": f"selected tab {arguments.get('index')}",
+                        }],
+                    }
+                elif method == "tools/call" and name == "browser_snapshot":
+                    result = {
+                        "content": [{
+                            "type": "text",
+                            "text": (
+                                "snapshot tab "
+                                f"{type(self).selected_tabs.get(session, 0)}"
+                            ),
+                        }],
+                    }
                 elif method == "tools/call":
                     result = {
                         "content": [{"type": "text", "text": "fake"}],
@@ -78,11 +107,21 @@ def run_fake_server(state_dir, port_file, event_file, mode="healthy"):
                         if mode == "bad_health"
                         else {"tools": []}
                     )
-                payload = json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": 999 if name == "wrong_id" else message["id"],
-                    "result": result,
-                }).encode()
+                if method == "tools/call" and name == "rpc_error":
+                    payload = json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "error": {
+                            "code": -32000,
+                            "message": "fake RPC error",
+                        },
+                    }).encode()
+                else:
+                    payload = json.dumps({
+                        "jsonrpc": "2.0",
+                        "id": 999 if name == "wrong_id" else message["id"],
+                        "result": result,
+                    }).encode()
                 status = 200
                 with self.mutex:
                     type(self).active -= 1
@@ -105,6 +144,9 @@ def run_fake_server(state_dir, port_file, event_file, mode="healthy"):
                 protocol=self.headers.get("Mcp-Protocol-Version"),
             )
             status = type(self).delete_status
+            if status == 200:
+                type(self).selected_tabs.pop(
+                    self.headers.get("Mcp-Session-Id"), None)
             payload = b"" if status == 200 else b"delete refused"
             self.send_response(status)
             self.send_header("Content-Length", str(len(payload)))
@@ -117,6 +159,7 @@ def run_fake_server(state_dir, port_file, event_file, mode="healthy"):
     server = ThreadingHTTPServer(("127.0.0.1", 0), FakeMCP)
     server.daemon_threads = True
     FakeMCP.delete_status = 500 if mode == "bad_delete" else 200
+    FakeMCP.selected_tabs = {}
     url = f"http://127.0.0.1:{server.server_port}/mcp"
     env = os.environ.copy()
     env.update({
@@ -214,6 +257,11 @@ class BrowserctlTests(unittest.TestCase):
             [CLIENT, *arguments], env=env, text=True, capture_output=True,
             check=check)
 
+    def run_sequence(self, calls, check=True, env_updates=None):
+        return self.run_client(
+            "sequence", json.dumps(calls), check=check,
+            env_updates=env_updates)
+
     def acquire(self, owner="test", wait="0", ttl="5"):
         return json.loads(self.run_client(
             "lease", "acquire", owner, wait, ttl).stdout)
@@ -298,6 +346,196 @@ class BrowserctlTests(unittest.TestCase):
         deletes = [event for event in self.events() if event["kind"] == "delete"]
         self.assertEqual(deletes[-1]["session"], "fake-session")
         self.assertEqual(deletes[-1]["protocol"], "2025-03-26")
+
+    def test_sequence_select_and_snapshot_share_one_session(self):
+        self.acquire()
+        result = json.loads(self.run_sequence([
+            {
+                "name": "browser_tabs",
+                "arguments": {"action": "select", "index": 1},
+            },
+            {"name": "browser_snapshot", "arguments": {}},
+        ]).stdout)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(
+            result[1]["content"][0]["text"], "snapshot tab 1")
+        events = self.events()
+        initializes = [
+            event for event in events
+            if event["kind"] == "post" and event["method"] == "initialize"
+        ]
+        calls = [
+            event for event in events
+            if event["kind"] == "post" and event["method"] == "tools/call"
+        ]
+        deletes = [event for event in events if event["kind"] == "delete"]
+        self.assertEqual(len(initializes), 1)
+        self.assertEqual(
+            [call["name"] for call in calls],
+            ["browser_tabs", "browser_snapshot"])
+        self.assertEqual([call["request_id"] for call in calls], [2, 3])
+        self.assertEqual(
+            {call["session"] for call in calls}, {"fake-session"})
+        starts = [
+            event for event in events
+            if event["kind"] == "operation_start"
+            and event["method"] == "tools/call"
+        ]
+        self.assertEqual(len({start["in_flight_id"] for start in starts}), 1)
+        self.assertIsNotNone(starts[0]["in_flight_id"])
+        self.assertEqual(len(deletes), 1)
+        self.assertEqual(deletes[0]["session"], "fake-session")
+
+    def assert_ambiguous_sequence_quarantines(self, tool, error_text):
+        self.acquire()
+        failed = self.run_sequence([
+            {"name": "ok", "arguments": {}},
+            {"name": tool, "arguments": {}},
+            {"name": "not_sent", "arguments": {}},
+        ], check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(error_text, failed.stderr)
+        calls = [
+            event for event in self.events()
+            if event["kind"] == "operation_start"
+            and event.get("method") == "tools/call"
+        ]
+        self.assertEqual([call["name"] for call in calls], ["ok", tool])
+        self.assertFalse(any(
+            event["kind"] == "delete" for event in self.events()))
+        status = json.loads(self.run_client("lease", "status").stdout)
+        self.assertEqual(status["state"], "recovery_required")
+
+    def test_sequence_malformed_result_quarantines(self):
+        self.assert_ambiguous_sequence_quarantines(
+            "malformed_result", "malformed sequence item 2 tools/call result")
+
+    def test_sequence_wrong_id_quarantines(self):
+        self.assert_ambiguous_sequence_quarantines(
+            "wrong_id", "mismatched sequence item 2 tools/call")
+
+    def test_sequence_first_tool_error_is_determinate(self):
+        self.acquire()
+        failed = self.run_sequence([
+            {"name": "error", "arguments": {}},
+            {"name": "not_sent", "arguments": {}},
+        ], check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "Playwright tool error in sequence item 1 tools/call",
+            failed.stderr)
+        calls = [
+            event for event in self.events()
+            if event["kind"] == "operation_start"
+            and event.get("method") == "tools/call"
+        ]
+        self.assertEqual([call["name"] for call in calls], ["error"])
+        self.assertEqual(len([
+            event for event in self.events() if event["kind"] == "delete"
+        ]), 1)
+        status = json.loads(self.run_client("lease", "status").stdout)
+        self.assertEqual(status["state"], "held")
+
+    def test_sequence_second_rpc_error_is_determinate(self):
+        self.acquire()
+        failed = self.run_sequence([
+            {"name": "ok", "arguments": {}},
+            {"name": "rpc_error", "arguments": {}},
+            {"name": "not_sent", "arguments": {}},
+        ], check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "sequence item 2 tools/call JSON-RPC error", failed.stderr)
+        calls = [
+            event for event in self.events()
+            if event["kind"] == "operation_start"
+            and event.get("method") == "tools/call"
+        ]
+        self.assertEqual(
+            [call["name"] for call in calls], ["ok", "rpc_error"])
+        self.assertEqual(len([
+            event for event in self.events() if event["kind"] == "delete"
+        ]), 1)
+        status = json.loads(self.run_client("lease", "status").stdout)
+        self.assertEqual(status["state"], "held")
+
+    def test_sequence_second_tool_error_is_determinate(self):
+        self.acquire()
+        failed = self.run_sequence([
+            {"name": "ok", "arguments": {}},
+            {"name": "error", "arguments": {}},
+            {"name": "not_sent", "arguments": {}},
+        ], check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn(
+            "Playwright tool error in sequence item 2 tools/call",
+            failed.stderr)
+        calls = [
+            event for event in self.events()
+            if event["kind"] == "operation_start"
+            and event.get("method") == "tools/call"
+        ]
+        self.assertEqual([call["name"] for call in calls], ["ok", "error"])
+        self.assertEqual(len([
+            event for event in self.events() if event["kind"] == "delete"
+        ]), 1)
+        status = json.loads(self.run_client("lease", "status").stdout)
+        self.assertEqual(status["state"], "held")
+
+    def test_sequence_second_timeout_quarantines(self):
+        self.acquire()
+        failed = self.run_sequence([
+            {"name": "ok", "arguments": {}},
+            {"name": "slow", "arguments": {}},
+            {"name": "not_sent", "arguments": {}},
+        ], check=False, env_updates={"BROWSERCTL_HTTP_TIMEOUT": "0.05"})
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("MCP request failed", failed.stderr)
+        self.assertFalse(any(
+            event["kind"] == "delete" for event in self.events()))
+        status = json.loads(self.run_client("lease", "status").stdout)
+        self.assertEqual(status["state"], "recovery_required")
+
+    def test_sequence_delete_failure_quarantines(self):
+        self.acquire()
+        failed = self.run_sequence([
+            {"name": "ok", "arguments": {}},
+            {"name": "delete_405", "arguments": {}},
+        ], check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("DELETE HTTP 405", failed.stderr)
+        self.assertEqual(len([
+            event for event in self.events() if event["kind"] == "delete"
+        ]), 1)
+        status = json.loads(self.run_client("lease", "status").stdout)
+        self.assertEqual(status["state"], "recovery_required")
+
+    def test_sequence_input_is_strict_and_bounded(self):
+        self.acquire()
+        calls = [{"name": "ok", "arguments": {}} for _ in range(10)]
+        self.assertEqual(len(json.loads(self.run_sequence(calls).stdout)), 10)
+        before = len([
+            event for event in self.events() if event["kind"] == "post"
+        ])
+        invalid = (
+            [],
+            calls + [{"name": "overflow", "arguments": {}}],
+            {"name": "not-an-array", "arguments": {}},
+            [1],
+            [{"name": "ok", "arguments": {}, "extra": True}],
+            [{"name": "ok", "arguments": []}],
+            [{"name": "", "arguments": {}}],
+            [{"command": "lease", "arguments": {"action": "release"}}],
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                failed = self.run_client(
+                    "sequence", json.dumps(value), check=False)
+                self.assertNotEqual(failed.returncode, 0)
+        after = len([
+            event for event in self.events() if event["kind"] == "post"
+        ])
+        self.assertEqual(after, before)
 
     def test_controller_launcher_pins_server_and_registers_generation(self):
         self.stop_server()

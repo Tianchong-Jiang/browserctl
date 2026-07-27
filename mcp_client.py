@@ -24,6 +24,7 @@ HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 LOCK_TIMEOUT = None
 MAX_WAIT = 3600.0
 MAX_TTL = 86400.0
+MAX_SEQUENCE_CALLS = 10
 
 
 def die(message):
@@ -713,6 +714,25 @@ def fail_rpc_error(operation, error):
     die(f"{operation} JSON-RPC error: {json.dumps(error)}")
 
 
+def parse_sequence(value):
+    try:
+        calls = json.loads(value)
+    except json.JSONDecodeError as exc:
+        die(f"sequence is malformed JSON: {exc}")
+    if not isinstance(calls, list):
+        die("sequence must be a JSON array")
+    if not 1 <= len(calls) <= MAX_SEQUENCE_CALLS:
+        die(f"sequence must contain 1-{MAX_SEQUENCE_CALLS} tool calls")
+    for index, call in enumerate(calls, 1):
+        if not isinstance(call, dict) or set(call) != {"name", "arguments"}:
+            die(f"sequence item {index} must contain exactly name and arguments")
+        if not isinstance(call["name"], str) or not call["name"]:
+            die(f"sequence item {index} name must be a nonempty string")
+        if not isinstance(call["arguments"], dict):
+            die(f"sequence item {index} arguments must be a JSON object")
+    return calls
+
+
 def initialize_session():
     initialized, session = post({
         "jsonrpc": "2.0",
@@ -777,7 +797,8 @@ def main():
         lease_command(sys.argv[2:])
         return
     if len(sys.argv) == 2 and sys.argv[1] == "list":
-        method, params = "tools/list", {}
+        operations = [("tools/list", {})]
+        sequence = False
     elif len(sys.argv) == 4 and sys.argv[1] == "call":
         try:
             arguments = json.loads(sys.argv[3])
@@ -785,11 +806,22 @@ def main():
             die(f"tool arguments are malformed JSON: {exc}")
         if not isinstance(arguments, dict):
             die("tool arguments must be a JSON object")
-        method = "tools/call"
-        params = {"name": sys.argv[2], "arguments": arguments}
+        operations = [(
+            "tools/call",
+            {"name": sys.argv[2], "arguments": arguments},
+        )]
+        sequence = False
+    elif len(sys.argv) == 3 and sys.argv[1] == "sequence":
+        calls = parse_sequence(sys.argv[2])
+        operations = [
+            ("tools/call", {"name": call["name"], "arguments": call["arguments"]})
+            for call in calls
+        ]
+        sequence = True
     else:
         die("usage: client.sh lease ... | client.sh list | "
-            "client.sh call TOOL JSON_OBJECT")
+            "client.sh call TOOL JSON_OBJECT | "
+            "client.sh sequence JSON_ARRAY")
 
     with locked_file("execution.lock"):
         with locked_file("state.lock"):
@@ -801,16 +833,40 @@ def main():
             lease = require_lease()
             lease["in_flight"] = {
                 "id": operation_id,
-                "method": method,
+                "method": operations[0][0],
                 "started_at": time.time(),
                 "controller_generation": controller["generation"],
             }
             write_lease(lease)
-        response, _ = post(
-            {"jsonrpc": "2.0", "id": 2, "method": method, "params": params}, session
-        )
-        validator = valid_call_result if method == "tools/call" else valid_list_result
-        result, error = checked(response, method, 2, validator)
+        results = []
+        determinate_error = None
+        for item, (method, params) in enumerate(operations, 1):
+            request_id = item + 1
+            operation = (
+                f"sequence item {item} tools/call"
+                if sequence else method
+            )
+            response, response_session = post({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }, session)
+            if response_session != session:
+                die(f"{operation} changed the MCP session ID")
+            validator = (
+                valid_call_result if method == "tools/call"
+                else valid_list_result
+            )
+            result, error = checked(
+                response, operation, request_id, validator)
+            if error is not None:
+                determinate_error = ("rpc", operation, error)
+                break
+            results.append(result)
+            if method == "tools/call" and result.get("isError") is True:
+                determinate_error = ("tool", operation, result)
+                break
         delete_session(session)
         with locked_file("state.lock"):
             lease = require_lease(
@@ -819,12 +875,16 @@ def main():
                 die("lease in-flight state changed unexpectedly")
             del lease["in_flight"]
             write_lease(lease)
-        if error is not None:
-            fail_rpc_error(method, error)
-    if method == "tools/call":
-        if result.get("isError") is True:
-            die(f"Playwright tool error: {json.dumps(result)}")
-    print(json.dumps(result, indent=2, sort_keys=True))
+        if determinate_error is not None:
+            kind, operation, error = determinate_error
+            if kind == "rpc":
+                fail_rpc_error(operation, error)
+            if sequence:
+                die(f"Playwright tool error in {operation}: "
+                    f"{json.dumps(error)}")
+            die(f"Playwright tool error: {json.dumps(error)}")
+    output = results if sequence else results[0]
+    print(json.dumps(output, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

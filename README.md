@@ -38,6 +38,7 @@ The launcher sets the pinned server's supported `PLAYWRIGHT_MCP_PING_TIMEOUT_MS=
 ./client.sh list
 ./client.sh call browser_navigate '{"url":"https://example.com"}'
 ./client.sh call browser_snapshot '{}'
+./client.sh sequence '[{"name":"browser_tabs","arguments":{"action":"select","index":1}},{"name":"browser_snapshot","arguments":{}}]'
 
 # Refresh during longer workflows, then release only after final verification/submission.
 ./client.sh lease renew 300
@@ -47,13 +48,15 @@ The launcher sets the pinned server's supported `PLAYWRIGHT_MCP_PING_TIMEOUT_MS=
 
 The client defaults to `http://127.0.0.1:47883/mcp`. Override `BROWSERCTL_MCP_URL` with an explicit `127.0.0.1` or `::1` URL, the outer `BROWSERCTL_TIMEOUT` (45 seconds), or per-request `BROWSERCTL_HTTP_TIMEOUT` (30 seconds) when needed. MCP requests explicitly bypass ambient proxy configuration. Transport failures, timeouts, malformed or mismatched JSON-RPC responses, JSON-RPC errors, and Playwright `isError` results all exit nonzero.
 
+`sequence JSON_ARRAY` accepts 1–10 items containing exactly `name` and object-valued `arguments`, runs those MCP tool calls in order within one session, and prints the result array. Use it when an operation depends on session-local state, such as selecting a tab and then snapshotting or interacting with that tab. It stops at the first JSON-RPC or Playwright tool error. Sequence items cannot dispatch client or lease commands.
+
 `lease acquire OWNER [WAIT_SECONDS] [TTL_SECONDS]` prints non-secret JSON describing the lease. Browser operations, renew, release, and recovery require the active singleton lease but need no token or environment credential; old `BROWSERCTL_LEASE_TOKEN` values are ignored. Wait is bounded to 3600 seconds and TTL to 86400 seconds. An expired idle lease is reclaimed automatically. An in-flight lease never auto-expires, even after its nominal TTL.
 
 `lease status` always reports `state` as `available`, `held`, or `recovery_required`, along with explicit `expired`, `in_flight`, and `recovery_required` booleans. Only an ordinary held lease has `expires_in`; recovery-required state deliberately has no misleading expiry countdown.
 
 State defaults to `${XDG_RUNTIME_DIR}/browserctl`, falling back to `${XDG_STATE_HOME:-$HOME/.local/state}/browserctl`, and `BROWSERCTL_STATE_DIR` can select a separate service/test state directory. The controller launcher and every client for that controller must use the same state directory and exact `BROWSERCTL_MCP_URL`.
 
-Before a tool request, the client durably marks the lease in flight. It clears that marker only after validating the correlated JSON-RPC envelope and operation-specific result, then successfully terminating the MCP session. A complete valid JSON-RPC or Playwright `isError` response is determinate and clears after successful session deletion before exiting nonzero. If a timeout, signal, crash, kill, malformed/mismatched response, malformed result, or failed session deletion leaves the server-side outcome unknown, all further calls, release, and stale-lease takeover fail loudly. Recovery requires restarting only the host-owned Playwright controller—not Edge—and then lets the client verify the new generation:
+Before a tool request, the client durably marks the lease in flight; a sequence uses one marker for the entire batch. It clears that marker only after validating every correlated JSON-RPC envelope and operation-specific result, then successfully terminating the MCP session. A complete valid JSON-RPC or Playwright `isError` response is determinate and clears after successful session deletion before exiting nonzero. If a timeout, signal, crash, kill, malformed/mismatched response, malformed result, or failed session deletion leaves the server-side outcome unknown, all further calls, release, and stale-lease takeover fail loudly. Recovery requires restarting only the host-owned Playwright controller—not Edge—and then lets the client verify the new generation:
 
 ```bash
 # Restart the Playwright controller with its host supervisor and confirm it is listening.
