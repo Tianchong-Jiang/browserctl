@@ -301,7 +301,6 @@ class BrowserctlTests(unittest.TestCase):
 
     def test_controller_launcher_pins_server_and_registers_generation(self):
         self.stop_server()
-        (self.state / "controller.json").unlink()
         fake_bin = Path(self.temporary.name) / "bin"
         fake_bin.mkdir()
         fake_npx = fake_bin / "npx"
@@ -309,22 +308,36 @@ class BrowserctlTests(unittest.TestCase):
             "#!/bin/sh\n"
             "printf '%s\\n' \"$PLAYWRIGHT_MCP_PING_TIMEOUT_MS\" \"$@\"\n")
         fake_npx.chmod(0o700)
-        result = subprocess.run(
-            [ROOT / "start-controller.sh"],
-            env={
-                **self.env,
-                "PATH": f"{fake_bin}:{self.env['PATH']}",
-                "BROWSERCTL_PORT": "47883",
-                "BROWSERCTL_MCP_URL": "http://127.0.0.1:47883/mcp",
-            },
-            text=True, capture_output=True, check=True)
-        lines = result.stdout.splitlines()
-        self.assertEqual(lines[0], "0")
-        self.assertIn("@playwright/mcp@0.0.78", lines)
-        controller = json.loads(
-            (self.state / "controller.json").read_text(encoding="utf-8"))
-        self.assertEqual(controller["schema_version"], 1)
-        self.assertEqual(len(controller["generation"]), 32)
+        cases = (
+            ("127.0.0.1", "http://127.0.0.1:47883/mcp",
+             "127.0.0.1:47883"),
+            ("::1", "http://[::1]:47883/mcp", "[::1]:47883"),
+        )
+        for host, url, allowed_host in cases:
+            with self.subTest(host=host):
+                (self.state / "controller.json").unlink(missing_ok=True)
+                result = subprocess.run(
+                    [ROOT / "start-controller.sh"],
+                    env={
+                        **self.env,
+                        "PATH": f"{fake_bin}:{self.env['PATH']}",
+                        "BROWSERCTL_HOST": host,
+                        "BROWSERCTL_PORT": "47883",
+                        "BROWSERCTL_MCP_URL": url,
+                    },
+                    text=True, capture_output=True, check=True)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines[0], "0")
+                self.assertIn("@playwright/mcp@0.0.78", lines)
+                self.assertEqual(lines[lines.index("--host") + 1], host)
+                self.assertEqual(
+                    lines[lines.index("--allowed-hosts") + 1], allowed_host)
+                self.assertNotIn("*", lines)
+                controller = json.loads(
+                    (self.state / "controller.json").read_text(
+                        encoding="utf-8"))
+                self.assertEqual(controller["schema_version"], 1)
+                self.assertEqual(len(controller["generation"]), 32)
 
     def assert_delete_error_quarantines(self, status):
         self.acquire()

@@ -15,6 +15,12 @@ if [[ "$BROWSERCTL_HOST" == localhost ]]; then
   BROWSERCTL_HOST=127.0.0.1
 fi
 
+if [[ "$BROWSERCTL_HOST" == "::1" ]]; then
+  BROWSERCTL_ALLOWED_HOST="[::1]:${BROWSERCTL_PORT}"
+else
+  BROWSERCTL_ALLOWED_HOST="${BROWSERCTL_HOST}:${BROWSERCTL_PORT}"
+fi
+
 if [[ -z "${BROWSERCTL_MCP_URL:-}" ]]; then
   if [[ "$BROWSERCTL_HOST" == "::1" ]]; then
     BROWSERCTL_MCP_URL="http://[::1]:${BROWSERCTL_PORT}/mcp"
@@ -34,4 +40,5 @@ exec env PLAYWRIGHT_MCP_PING_TIMEOUT_MS=0 \
   --cdp-endpoint "$BROWSERCTL_CDP_ENDPOINT" \
   --shared-browser-context \
   --host "$BROWSERCTL_HOST" \
+  --allowed-hosts "$BROWSERCTL_ALLOWED_HOST" \
   --port "$BROWSERCTL_PORT"

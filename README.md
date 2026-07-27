@@ -25,6 +25,8 @@ The foreground controller defaults to `127.0.0.1:47883`. Run it under a host-own
 
 Always launch the controller through `start-controller.sh`. Before starting MCP it records a new controller generation, launcher PID, Linux `/proc` process-start identity, and MCP URL while holding the same `execution.lock` used by tool calls. Clients require the live registered process tree to own the exact configured loopback address, family, and port. This binds an in-flight operation to the controller that could execute it without adding a proxy or relying on a caller assertion.
 
+The launcher also pins Playwright MCP's allowed host to the exact numeric loopback authority it binds (`127.0.0.1:<port>` or `[::1]:<port>`), never a wildcard. This keeps the server's host-header protection aligned with the client URL.
+
 The launcher sets the pinned server's supported `PLAYWRIGHT_MCP_PING_TIMEOUT_MS=0`. Its default Streamable HTTP heartbeat expects a persistent server-to-client channel that this one-command client deliberately does not keep open and can abort tools after roughly five seconds. Completed commands explicitly terminate their MCP session with HTTP `DELETE`; because the pinned server supports deletion, any DELETE error, including HTTP 405, is a failed termination and quarantines the workflow.
 
 ## Use
