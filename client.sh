@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-: "${BROWSERCTL_MCP_URL:=http://localhost:47883/mcp}"
+: "${BROWSERCTL_MCP_URL:=http://127.0.0.1:47883/mcp}"
 : "${BROWSERCTL_TIMEOUT:=45}"
 
 if [[ "${1:-}" == lease ]]; then

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Minimal leased Streamable HTTP MCP client with strict failures."""
+"""Minimal tokenless leased Streamable HTTP MCP client with strict failures."""
 
+import base64
+import binascii
 import contextlib
 import fcntl
-import hashlib
-import hmac
 import json
 import math
 import os
@@ -15,10 +15,12 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
-URL = os.environ.get("BROWSERCTL_MCP_URL", "http://localhost:47883/mcp")
+URL = os.environ.get("BROWSERCTL_MCP_URL", "http://127.0.0.1:47883/mcp")
 TIMEOUT = float(os.environ.get("BROWSERCTL_HTTP_TIMEOUT", "30"))
+HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 LOCK_TIMEOUT = None
 MAX_WAIT = 3600.0
 MAX_TTL = 86400.0
@@ -54,8 +56,8 @@ def state_directory():
         path = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
         path /= "browserctl"
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    stat = path.lstat()
-    if path.is_symlink() or not path.is_dir() or stat.st_uid != os.getuid():
+    path_stat = path.lstat()
+    if path.is_symlink() or not path.is_dir() or path_stat.st_uid != os.getuid():
         die(f"unsafe state directory: {path}")
     os.chmod(path, 0o700)
     return path
@@ -87,8 +89,8 @@ def locked_file(name):
         os.close(fd)
 
 
-def lease_path():
-    return state_directory() / "lease.json"
+def state_path(name):
+    return state_directory() / name
 
 
 def fsync_directory(directory):
@@ -99,8 +101,8 @@ def fsync_directory(directory):
         os.close(directory_fd)
 
 
-def read_lease():
-    path = lease_path()
+def read_private_json(name, missing_ok=False):
+    path = state_path(name)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -111,55 +113,27 @@ def read_lease():
                 or file_stat.st_uid != os.getuid()
                 or file_stat.st_mode & 0o077):
             os.close(fd)
-            die("lease state is not a private owner-controlled regular file")
+            die(f"{name} is not a private owner-controlled regular file")
         with os.fdopen(fd, encoding="utf-8") as stream:
-            lease = json.load(stream)
+            return json.load(stream)
     except FileNotFoundError:
-        return None
+        if missing_ok:
+            return None
+        die(f"{name} is missing")
     except (OSError, json.JSONDecodeError) as exc:
-        die(f"cannot read lease state: {exc}")
-    required = {"owner", "token_hash", "acquired_at", "expires_at"}
-    allowed = required | {"in_flight"}
-    numeric = lambda value: type(value) in (int, float) and math.isfinite(value)
-    valid = (
-        isinstance(lease, dict)
-        and set(lease) <= allowed
-        and required <= lease.keys()
-        and isinstance(lease["owner"], str)
-        and 0 < len(lease["owner"]) <= 200
-        and isinstance(lease["token_hash"], str)
-        and len(lease["token_hash"]) == 64
-        and all(char in "0123456789abcdef" for char in lease["token_hash"])
-        and numeric(lease["acquired_at"])
-        and numeric(lease["expires_at"])
-        and lease["expires_at"] >= lease["acquired_at"]
-    )
-    if valid and "in_flight" in lease:
-        operation = lease["in_flight"]
-        valid = (
-            isinstance(operation, dict)
-            and set(operation) == {"id", "method", "started_at"}
-            and isinstance(operation["id"], str)
-            and len(operation["id"]) == 32
-            and all(char in "0123456789abcdef" for char in operation["id"])
-            and operation["method"] in {"tools/list", "tools/call"}
-            and numeric(operation["started_at"])
-        )
-    if not valid:
-        die("lease state is malformed")
-    return lease
+        die(f"cannot read {name}: {exc}")
 
 
-def write_lease(lease):
+def write_private_json(name, value):
     directory = state_directory()
-    fd, temporary = tempfile.mkstemp(prefix=".lease.", dir=directory)
+    fd, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=directory)
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(lease, stream, separators=(",", ":"))
+            json.dump(value, stream, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, lease_path())
+        os.replace(temporary, state_path(name))
         fsync_directory(directory)
     finally:
         try:
@@ -168,20 +142,104 @@ def write_lease(lease):
             pass
 
 
-def remove_lease():
+def remove_state(name):
     try:
-        lease_path().unlink()
+        state_path(name).unlink()
         fsync_directory(state_directory())
     except FileNotFoundError:
         pass
 
 
-def token_hash(token):
-    return hashlib.sha256(token.encode()).hexdigest()
+def numeric(value):
+    return type(value) in (int, float) and math.isfinite(value)
 
 
-def token_matches(lease, token):
-    return hmac.compare_digest(lease["token_hash"], token_hash(token))
+def valid_operation(operation, require_generation):
+    required = {"id", "method", "started_at"}
+    if require_generation:
+        required.add("controller_generation")
+    valid = (
+        isinstance(operation, dict)
+        and set(operation) == required
+        and isinstance(operation.get("id"), str)
+        and len(operation["id"]) == 32
+        and all(char in "0123456789abcdef" for char in operation["id"])
+        and operation.get("method") in {"tools/list", "tools/call"}
+        and numeric(operation.get("started_at"))
+    )
+    if require_generation:
+        valid = (
+            valid
+            and isinstance(operation.get("controller_generation"), str)
+            and len(operation["controller_generation"]) == 32
+            and all(char in "0123456789abcdef"
+                    for char in operation["controller_generation"])
+        )
+    return valid
+
+
+def valid_common_lease(lease, allowed, required):
+    return (
+        isinstance(lease, dict)
+        and set(lease) <= allowed
+        and required <= lease.keys()
+        and isinstance(lease.get("owner"), str)
+        and 0 < len(lease["owner"]) <= 200
+        and numeric(lease.get("acquired_at"))
+        and numeric(lease.get("expires_at"))
+        and lease["expires_at"] >= lease["acquired_at"]
+    )
+
+
+def read_lease():
+    lease = read_private_json("lease.json", missing_ok=True)
+    if lease is None:
+        return None
+
+    required = {"schema_version", "owner", "acquired_at", "expires_at"}
+    allowed = required | {"in_flight"}
+    valid = (
+        valid_common_lease(lease, allowed, required)
+        and lease["schema_version"] == 1
+        and ("in_flight" not in lease
+             or valid_operation(lease["in_flight"], require_generation=True))
+    )
+    if valid:
+        return lease
+
+    legacy_required = {"owner", "token_hash", "acquired_at", "expires_at"}
+    legacy_allowed = legacy_required | {"in_flight"}
+    legacy = (
+        valid_common_lease(lease, legacy_allowed, legacy_required)
+        and isinstance(lease["token_hash"], str)
+        and len(lease["token_hash"]) == 64
+        and all(char in "0123456789abcdef" for char in lease["token_hash"])
+        and ("in_flight" not in lease
+             or valid_operation(lease["in_flight"], require_generation=False))
+    )
+    if not legacy:
+        die("lease state is malformed")
+    if "in_flight" in lease:
+        die("legacy lease has an indeterminate operation but no controller "
+            "generation; restart the controller and perform manual operator "
+            "recovery before using this state")
+
+    migrated = {
+        "schema_version": 1,
+        "owner": lease["owner"],
+        "acquired_at": lease["acquired_at"],
+        "expires_at": lease["expires_at"],
+    }
+    write_lease(migrated)
+    return migrated
+
+
+def write_lease(lease):
+    write_private_json("lease.json", lease)
+
+
+def remove_lease():
+    remove_state("lease.json")
 
 
 def active_lease(now=None):
@@ -193,11 +251,16 @@ def active_lease(now=None):
     return lease
 
 
-def lease_token():
-    token = os.environ.get("BROWSERCTL_LEASE_TOKEN")
-    if not token:
-        die("BROWSERCTL_LEASE_TOKEN is required")
-    return token
+def require_lease(allow_in_flight=False, allow_expired=False):
+    lease = active_lease()
+    if lease is None:
+        die("no active singleton lease")
+    if "in_flight" in lease and not allow_in_flight:
+        die("lease has an indeterminate in-flight MCP operation; restart the "
+            "controller, then run lease recover")
+    if lease["expires_at"] <= time.time() and not allow_expired:
+        die("lease is expired")
+    return lease
 
 
 def acquire(owner, wait, ttl):
@@ -209,43 +272,240 @@ def acquire(owner, wait, ttl):
             now = time.time()
             lease = active_lease(now)
             if lease is None:
-                token = secrets.token_urlsafe(32)
-                write_lease({
+                lease = {
+                    "schema_version": 1,
                     "owner": owner,
-                    "token_hash": token_hash(token),
                     "acquired_at": now,
                     "expires_at": now + ttl,
-                })
-                print(token)
+                }
+                write_lease(lease)
+                print(json.dumps({
+                    "acquired": True,
+                    "owner": owner,
+                    "acquired_at": now,
+                    "expires_at": now + ttl,
+                }, sort_keys=True))
                 return
             held_by = lease["owner"]
             in_flight = "in_flight" in lease
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             if in_flight:
-                die(f"lease held by {held_by!r} has an in-flight MCP operation; "
-                    "restart the controller, then recover the lease")
+                die(f"lease held by {held_by!r} requires recovery for an "
+                    "in-flight MCP operation")
             die(f"lease is held by {held_by!r}")
         time.sleep(min(0.05, remaining))
 
 
-def validate_token(token, allow_in_flight=False, allow_expired=False):
-    lease = active_lease()
+def process_identity(pid):
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = text.rsplit(")", 1)[1].strip().split()
+        return fields[19]
+    except (FileNotFoundError, IndexError, OSError):
+        return None
+
+
+def parse_controller(value):
+    required = {
+        "schema_version", "generation", "pid", "process_start_time",
+        "mcp_url", "registered_at",
+    }
+    valid = (
+        isinstance(value, dict)
+        and set(value) == required
+        and value.get("schema_version") == 1
+        and isinstance(value.get("generation"), str)
+        and len(value["generation"]) == 32
+        and all(char in "0123456789abcdef" for char in value["generation"])
+        and type(value.get("pid")) is int
+        and value["pid"] > 1
+        and isinstance(value.get("process_start_time"), str)
+        and value["process_start_time"].isdigit()
+        and isinstance(value.get("mcp_url"), str)
+        and numeric(value.get("registered_at"))
+    )
+    if not valid:
+        die("controller generation state is malformed")
+    return value
+
+
+def read_controller(missing_ok=False):
+    value = read_private_json("controller.json", missing_ok=missing_ok)
+    return None if value is None else parse_controller(value)
+
+
+def controller_process_alive(controller):
+    return process_identity(controller["pid"]) == controller["process_start_time"]
+
+
+def endpoint():
+    parsed = urllib.parse.urlsplit(URL)
+    if (parsed.scheme != "http" or parsed.path != "/mcp"
+            or parsed.query or parsed.fragment
+            or parsed.hostname not in {"127.0.0.1", "::1"}
+            or parsed.port is None):
+        die("BROWSERCTL_MCP_URL must use explicit 127.0.0.1 or ::1 with "
+            "http://.../mcp and an explicit port")
+    return parsed
+
+
+def listening_inodes(address, port):
+    found = set()
+    if address == "127.0.0.1":
+        table, encoded_address = "/proc/net/tcp", "0100007F"
+    else:
+        table = "/proc/net/tcp6"
+        encoded_address = "00000000000000000000000001000000"
+    try:
+        lines = Path(table).read_text(encoding="ascii").splitlines()[1:]
+    except OSError as exc:
+        die(f"cannot inspect controller listeners: {exc}")
+    for line in lines:
+        fields = line.split()
+        if len(fields) > 9:
+            local_address, local_port = fields[1].rsplit(":", 1)
+            if (local_address == encoded_address
+                    and int(local_port, 16) == port
+                    and fields[3] == "0A"):
+                found.add(fields[9])
+    return found
+
+
+def process_tree(root_pid):
+    parents = {}
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            text = (entry / "stat").read_text(encoding="utf-8")
+            fields = text.rsplit(")", 1)[1].strip().split()
+            parents[int(entry.name)] = int(fields[1])
+        except (FileNotFoundError, IndexError, OSError, ValueError):
+            continue
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, parent in parents.items():
+            if parent in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    return descendants
+
+
+def process_tree_owns_listener(root_pid, address, port):
+    inodes = listening_inodes(address, port)
+    if not inodes:
+        return False
+    for pid in process_tree(root_pid):
+        try:
+            descriptors = Path(f"/proc/{pid}/fd").iterdir()
+            for descriptor in descriptors:
+                try:
+                    target = os.readlink(descriptor)
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+                if (target.startswith("socket:[") and target.endswith("]")
+                        and target[8:-1] in inodes):
+                    return True
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+    return False
+
+
+def validated_controller():
+    controller = read_controller()
+    parsed = endpoint()
+    if controller["mcp_url"] != URL:
+        die("controller generation belongs to a different MCP URL")
+    if not controller_process_alive(controller):
+        die("recorded controller process is missing or was replaced")
+    if not process_tree_owns_listener(
+            controller["pid"], parsed.hostname, parsed.port):
+        die("recorded controller process tree does not own the exact MCP "
+            "listener address and port")
+    return controller
+
+
+def register_controller(arguments):
+    if len(arguments) != 2:
+        die("internal controller registration usage error")
+    try:
+        pid = int(arguments[0])
+    except ValueError:
+        die("controller PID is invalid")
+    if pid != os.getppid():
+        die("controller registration PID must be the registering process parent")
+    parsed = endpoint()
+    if arguments[1] != URL or parsed.geturl() != URL:
+        die("controller registration URL mismatch")
+    configured_host = os.environ.get("BROWSERCTL_CONTROLLER_HOST")
+    if parsed.hostname != configured_host:
+        die("controller registration URL and bind host differ")
+    try:
+        configured_port = int(os.environ["BROWSERCTL_CONTROLLER_PORT"])
+    except (KeyError, ValueError):
+        die("controller registration port is invalid")
+    if parsed.port != configured_port:
+        die("controller registration URL and listening port differ")
+    start_time = process_identity(pid)
+    if start_time is None:
+        die("controller launcher process is missing")
+    with locked_file("execution.lock"):
+        with locked_file("state.lock"):
+            previous = read_controller(missing_ok=True)
+            if previous is not None and controller_process_alive(previous):
+                die("the previously registered controller process is still alive")
+            write_private_json("controller.json", {
+                "schema_version": 1,
+                "generation": secrets.token_hex(16),
+                "pid": pid,
+                "process_start_time": start_time,
+                "mcp_url": arguments[1],
+                "registered_at": time.time(),
+            })
+
+
+def lease_status():
+    now = time.time()
+    lease = read_lease()
+    reclaimed = False
+    if lease and "in_flight" not in lease and lease["expires_at"] <= now:
+        remove_lease()
+        lease = None
+        reclaimed = True
     if lease is None:
-        die("no active lease")
-    if not token_matches(lease, token):
-        die("lease token is invalid or expired")
-    if "in_flight" in lease and not allow_in_flight:
-        die("lease has an indeterminate in-flight MCP operation; restart the "
-            "controller, then run lease recover --controller-restarted")
-    if lease["expires_at"] <= time.time() and not allow_expired:
-        die("lease token is invalid or expired")
-    return lease
+        return {
+            "state": "available",
+            "available": True,
+            "expired": False,
+            "in_flight": False,
+            "recovery_required": False,
+            "reclaimed_expired_lease": reclaimed,
+        }
+    expired = lease["expires_at"] <= now
+    in_flight = "in_flight" in lease
+    status = {
+        "state": "recovery_required" if in_flight else "held",
+        "available": False,
+        "owner": lease["owner"],
+        "acquired_at": lease["acquired_at"],
+        "expires_at": lease["expires_at"],
+        "expired": expired,
+        "in_flight": in_flight,
+        "recovery_required": in_flight,
+    }
+    if in_flight:
+        status["in_flight_operation"] = lease["in_flight"]
+    else:
+        status["expires_in"] = max(0, lease["expires_at"] - now)
+    return status
 
 
 def lease_command(arguments):
     if not arguments:
-        die("usage: client.sh lease acquire|renew|status|release ...")
+        die("usage: client.sh lease acquire|renew|status|release|recover ...")
     action = arguments[0]
     if action == "acquire" and 2 <= len(arguments) <= 4:
         wait = parse_duration(arguments[2] if len(arguments) > 2 else "0",
@@ -256,51 +516,66 @@ def lease_command(arguments):
     elif action == "renew" and len(arguments) <= 2:
         ttl = parse_duration(arguments[1] if len(arguments) == 2 else "300",
                              "TTL", 0.1, MAX_TTL)
-        token = lease_token()
         with locked_file("state.lock"):
-            lease = validate_token(token)
+            lease = require_lease()
             lease["expires_at"] = time.time() + ttl
             write_lease(lease)
-        print(json.dumps({"owner": lease["owner"], "expires_at": lease["expires_at"]}))
+        print(json.dumps({
+            "renewed": True,
+            "owner": lease["owner"],
+            "expires_at": lease["expires_at"],
+        }, sort_keys=True))
     elif action == "status" and len(arguments) == 1:
         with locked_file("state.lock"):
-            lease = active_lease()
-        if lease:
-            print(json.dumps({
-                "available": False,
-                "owner": lease["owner"],
-                "expires_at": lease["expires_at"],
-                "expires_in": max(0, lease["expires_at"] - time.time()),
-                "in_flight": "in_flight" in lease,
-            }))
-        else:
-            print(json.dumps({"available": True}))
+            status = lease_status()
+        print(json.dumps(status, sort_keys=True))
     elif action == "release" and len(arguments) == 1:
-        token = lease_token()
         with locked_file("execution.lock"):
             with locked_file("state.lock"):
-                lease = validate_token(token)
+                lease = require_lease()
                 remove_lease()
-        print(json.dumps({"released": True, "owner": lease["owner"]}))
-    elif (action == "recover" and 2 <= len(arguments) <= 3
-          and arguments[1] == "--controller-restarted"):
-        ttl = parse_duration(arguments[2] if len(arguments) == 3 else "300",
+        print(json.dumps({
+            "released": True,
+            "owner": lease["owner"],
+        }, sort_keys=True))
+    elif action == "recover" and len(arguments) <= 2:
+        ttl = parse_duration(arguments[1] if len(arguments) == 2 else "300",
                              "TTL", 0.1, MAX_TTL)
-        token = lease_token()
         with locked_file("execution.lock"):
             with locked_file("state.lock"):
-                lease = validate_token(
-                    token, allow_in_flight=True, allow_expired=True)
-                if "in_flight" not in lease:
+                lease = require_lease(
+                    allow_in_flight=True, allow_expired=True)
+                operation = lease.get("in_flight")
+                if operation is None:
                     die("lease has no indeterminate operation to recover")
+                operation_id = operation["id"]
+                old_generation = operation["controller_generation"]
+            controller = validated_controller()
+            if controller["generation"] == old_generation:
+                die("controller generation is unchanged; restart the controller "
+                    "that could have executed the operation")
+            functional_health_check()
+            with locked_file("state.lock"):
+                lease = require_lease(
+                    allow_in_flight=True, allow_expired=True)
+                current = lease.get("in_flight", {})
+                if (current.get("id") != operation_id
+                        or current.get("controller_generation")
+                        != old_generation):
+                    die("lease in-flight state changed unexpectedly")
                 del lease["in_flight"]
                 lease["expires_at"] = time.time() + ttl
                 write_lease(lease)
-        print(json.dumps({"recovered": True, "owner": lease["owner"]}))
+        print(json.dumps({
+            "recovered": True,
+            "owner": lease["owner"],
+            "controller_generation": controller["generation"],
+            "expires_at": lease["expires_at"],
+        }, sort_keys=True))
     else:
         die("usage: client.sh lease acquire OWNER [WAIT_SECONDS] [TTL_SECONDS] | "
             "lease renew [TTL_SECONDS] | lease status | lease release | "
-            "lease recover --controller-restarted [TTL_SECONDS]")
+            "lease recover [TTL_SECONDS]")
 
 
 def decode(body, content_type):
@@ -340,7 +615,7 @@ def post(message, session=None, response_required=True):
         URL, json.dumps(message, separators=(",", ":")).encode(), headers
     )
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with HTTP.open(request, timeout=TIMEOUT) as response:
             body = response.read()
             new_session = response.headers.get("Mcp-Session-Id", session)
             if not response_required:
@@ -363,7 +638,7 @@ def delete_session(session):
         method="DELETE",
     )
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+        with HTTP.open(request, timeout=TIMEOUT) as response:
             response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read(2000).decode(errors="replace")
@@ -372,17 +647,132 @@ def delete_session(session):
         die(f"MCP session DELETE failed: {exc}")
 
 
-def checked(response, operation):
-    if not isinstance(response, dict):
-        die(f"malformed {operation} response")
-    if "error" in response:
-        die(f"{operation} JSON-RPC error: {json.dumps(response['error'])}")
-    if "result" not in response:
-        die(f"malformed {operation} response: missing result")
-    return response["result"]
+def valid_list_result(result):
+    return (
+        isinstance(result, dict)
+        and isinstance(result.get("tools"), list)
+        and all(isinstance(tool, dict) for tool in result["tools"])
+    )
+
+
+def valid_call_result(result):
+    return (
+        isinstance(result, dict)
+        and isinstance(result.get("content"), list)
+        and all(valid_content_block(item) for item in result["content"])
+        and ("isError" not in result or type(result["isError"]) is bool)
+    )
+
+
+def valid_content_block(item):
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") == "text":
+        return isinstance(item.get("text"), str)
+    if item.get("type") == "image":
+        if (item.get("mimeType") not in {"image/png", "image/jpeg"}
+                or not isinstance(item.get("data"), str)
+                or not item["data"]):
+            return False
+        try:
+            base64.b64decode(item["data"], validate=True)
+        except (binascii.Error, ValueError):
+            return False
+        return True
+    return False
+
+
+def checked(response, operation, request_id, result_validator):
+    if (not isinstance(response, dict)
+            or response.get("jsonrpc") != "2.0"
+            or type(response.get("id")) is not type(request_id)
+            or response.get("id") != request_id):
+        die(f"malformed or mismatched {operation} JSON-RPC response")
+    has_result = "result" in response
+    has_error = "error" in response
+    if has_result == has_error:
+        die(f"malformed {operation} JSON-RPC result/error envelope")
+    expected = {"jsonrpc", "id", "result" if has_result else "error"}
+    if set(response) != expected:
+        die(f"malformed {operation} JSON-RPC response fields")
+    if has_error:
+        error = response["error"]
+        if (not isinstance(error, dict)
+                or not {"code", "message"} <= error.keys()
+                or not set(error) <= {"code", "message", "data"}
+                or type(error["code"]) is not int
+                or not isinstance(error["message"], str)):
+            die(f"malformed {operation} JSON-RPC error")
+        return None, error
+    if not result_validator(response["result"]):
+        die(f"malformed {operation} result")
+    return response["result"], None
+
+
+def fail_rpc_error(operation, error):
+    die(f"{operation} JSON-RPC error: {json.dumps(error)}")
+
+
+def initialize_session():
+    initialized, session = post({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "browserctl", "version": "0.2.0"},
+        },
+    })
+    _, error = checked(
+        initialized, "initialize", 1, lambda result: isinstance(result, dict))
+    if error is not None:
+        fail_rpc_error("initialize", error)
+    if not session:
+        die("initialize response omitted Mcp-Session-Id")
+    post(
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        session,
+        response_required=False,
+    )
+    return session
+
+
+def functional_health_check():
+    session = initialize_session()
+    response, _ = post(
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        session,
+    )
+    _, error = checked(
+        response, "controller health tools/list", 2, valid_list_result)
+    if error is not None:
+        delete_session(session)
+        fail_rpc_error("controller health tools/list", error)
+    response, _ = post({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "browser_tabs",
+            "arguments": {"action": "list"},
+        },
+    }, session)
+    result, error = checked(
+        response, "controller health browser_tabs", 3, valid_call_result)
+    delete_session(session)
+    if error is not None:
+        fail_rpc_error("controller health browser_tabs", error)
+    if result.get("isError") is True:
+        die(f"controller browser health probe failed: {json.dumps(result)}")
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "controller":
+        if len(sys.argv) >= 3 and sys.argv[2] == "register":
+            register_controller(sys.argv[3:])
+            return
+        die("internal controller command is invalid")
     if len(sys.argv) >= 2 and sys.argv[1] == "lease":
         lease_command(sys.argv[2:])
         return
@@ -401,56 +791,39 @@ def main():
         die("usage: client.sh lease ... | client.sh list | "
             "client.sh call TOOL JSON_OBJECT")
 
-    token = lease_token()
     with locked_file("execution.lock"):
         with locked_file("state.lock"):
-            validate_token(token)
-        initialized, session = post({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-03-26",
-                "capabilities": {},
-                "clientInfo": {"name": "browserctl", "version": "0.1.0"},
-            },
-        })
-        checked(initialized, "initialize")
-        if not session:
-            die("initialize response omitted Mcp-Session-Id")
-        post(
-            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-            session,
-            response_required=False,
-        )
+            require_lease()
+        controller = validated_controller()
+        session = initialize_session()
         operation_id = secrets.token_hex(16)
         with locked_file("state.lock"):
-            lease = validate_token(token)
+            lease = require_lease()
             lease["in_flight"] = {
                 "id": operation_id,
                 "method": method,
                 "started_at": time.time(),
+                "controller_generation": controller["generation"],
             }
             write_lease(lease)
         response, _ = post(
             {"jsonrpc": "2.0", "id": 2, "method": method, "params": params}, session
         )
+        validator = valid_call_result if method == "tools/call" else valid_list_result
+        result, error = checked(response, method, 2, validator)
         delete_session(session)
         with locked_file("state.lock"):
-            lease = validate_token(
-                token, allow_in_flight=True, allow_expired=True)
+            lease = require_lease(
+                allow_in_flight=True, allow_expired=True)
             if lease.get("in_flight", {}).get("id") != operation_id:
                 die("lease in-flight state changed unexpectedly")
             del lease["in_flight"]
             write_lease(lease)
-        result = checked(response, method)
+        if error is not None:
+            fail_rpc_error(method, error)
     if method == "tools/call":
-        if not isinstance(result, dict) or not isinstance(result.get("content"), list):
-            die("malformed tools/call result")
         if result.get("isError") is True:
             die(f"Playwright tool error: {json.dumps(result)}")
-    elif not isinstance(result, dict) or not isinstance(result.get("tools"), list):
-        die("malformed tools/list result")
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
