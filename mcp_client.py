@@ -9,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 import sys
@@ -18,7 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-VERSION = 2
+VERSION = 3
 PROTOCOL = "2025-03-26"
 MAX_WAIT = 3600.0
 MAX_BODY = 16 * 1024 * 1024
@@ -27,7 +28,20 @@ PHASES = {"initializing", "ready", "in_progress", "result_pending",
 LEASE_KEYS = {"schema_version", "phase", "owner", "acquired_at", "mcp_url",
               "cdp_endpoint", "controller_generation", "session_id",
               "protocol_version", "next_request_id", "client", "operation",
-              "receipt", "reason"}
+              "receipt", "reason", "snapshot_ready"}
+CONTROLLER_KEYS = {
+    "schema_version", "phase", "generation", "pid", "start", "boot_id",
+    "mcp_url", "cdp_endpoint", "registered_at", "ready_at",
+    "anchor_session_id", "anchor_protocol_version", "anchor_next_request_id",
+}
+FORBIDDEN_TOOLS = {
+    "browser_get_config", "browser_close", "browser_run_code_unsafe",
+}
+REF_TARGET_KEYS = {"target", "startTarget", "endTarget"}
+INVALIDATE_TOOLS = {
+    "browser_navigate", "browser_reload", "browser_navigate_back",
+    "browser_navigate_forward",
+}
 SYNCED_STATE_DIRS = set()
 
 
@@ -299,7 +313,8 @@ def parse_lease(value):
                    or valid_receipt(value["receipt"]))
               and (value.get("reason") is None
                    or isinstance(value["reason"], str)
-                   and 0 < len(value["reason"]) <= 1000))
+                   and 0 < len(value["reason"]) <= 1000)
+              and type(value.get("snapshot_ready")) is bool)
     if not scalar:
         fail("lease state is malformed or unsupported")
     phase = value["phase"]
@@ -366,10 +381,9 @@ def cdp_endpoint():
 
 
 def parse_controller(value):
-    keys = {"schema_version", "generation", "pid", "start", "boot_id",
-            "mcp_url", "cdp_endpoint", "registered_at"}
-    if not (isinstance(value, dict) and set(value) == keys
+    if not (isinstance(value, dict) and set(value) == CONTROLLER_KEYS
             and value.get("schema_version") == VERSION
+            and value.get("phase") in {"starting", "ready"}
             and isinstance(value.get("generation"), str)
             and len(value["generation"]) == 32
             and all(char in "0123456789abcdef" for char in value["generation"])
@@ -378,10 +392,35 @@ def parse_controller(value):
             and isinstance(value.get("boot_id"), str)
             and len(value["boot_id"]) == 36
             and isinstance(value.get("registered_at"), (int, float))
-            and math.isfinite(value["registered_at"])):
+            and math.isfinite(value["registered_at"])
+            and (value.get("ready_at") is None
+                 or isinstance(value["ready_at"], (int, float))
+                 and math.isfinite(value["ready_at"]))
+            and (value.get("anchor_session_id") is None
+                 or isinstance(value["anchor_session_id"], str)
+                 and 0 < len(value["anchor_session_id"]) <= 256
+                 and all(32 <= ord(char) < 127
+                         for char in value["anchor_session_id"]))
+            and (value.get("anchor_protocol_version") is None
+                 or value["anchor_protocol_version"] == PROTOCOL)
+            and type(value.get("anchor_next_request_id")) is int
+            and value["anchor_next_request_id"] > 0):
         fail("controller state is malformed or unsupported")
     endpoint(value["mcp_url"], "recorded MCP URL", True)
     endpoint(value["cdp_endpoint"], "recorded CDP endpoint")
+    if value["phase"] == "starting":
+        shape = (value["ready_at"] is None
+                 and value["anchor_session_id"] is None
+                 and value["anchor_protocol_version"] is None
+                 and value["anchor_next_request_id"] == 1)
+    else:
+        shape = (value["ready_at"] is not None
+                 and value["ready_at"] >= value["registered_at"]
+                 and value["anchor_session_id"]
+                 and value["anchor_protocol_version"] == PROTOCOL
+                 and value["anchor_next_request_id"] >= 4)
+    if not shape:
+        fail("controller phase fields are inconsistent")
     return value
 
 
@@ -390,6 +429,11 @@ def read_controller(missing=False):
     if value is None:
         return None
     return parse_controller(value)
+
+
+def write_controller(value):
+    parse_controller(value)
+    write_json("controller.json", value)
 
 
 def controller_alive(value):
@@ -450,7 +494,7 @@ def validate_config(cdp, mcp):
         fail("caller CDP endpoint does not match the lease")
 
 
-def validate_controller(generation=None, cdp=None, mcp=None):
+def validate_controller(generation=None, cdp=None, mcp=None, ready=True):
     value = read_controller()
     expected_mcp = mcp if mcp is not None else mcp_url()
     expected_cdp = cdp if cdp is not None else cdp_endpoint()
@@ -460,6 +504,8 @@ def validate_controller(generation=None, cdp=None, mcp=None):
         fail("registered controller has a different CDP endpoint")
     if generation and value["generation"] != generation:
         fail("registered controller generation changed")
+    if ready and value["phase"] != "ready":
+        fail("registered controller is not ready")
     parsed = urllib.parse.urlsplit(value["mcp_url"])
     if not controller_alive(value):
         fail("registered controller is dead, replaced, reboot-stale, or a zombie")
@@ -492,9 +538,12 @@ def register(arguments):
         if previous and controller_alive(previous):
             fail("previously registered controller is still alive")
         write_json("controller.json", {
-            "schema_version": VERSION, "generation": secrets.token_hex(16),
+            "schema_version": VERSION, "phase": "starting",
+            "generation": secrets.token_hex(16),
             "pid": pid, "start": start, "boot_id": boot_id(),
-            "mcp_url": mcp, "cdp_endpoint": cdp, "registered_at": time.time()})
+            "mcp_url": mcp, "cdp_endpoint": cdp, "registered_at": time.time(),
+            "ready_at": None, "anchor_session_id": None,
+            "anchor_protocol_version": None, "anchor_next_request_id": 1})
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -553,8 +602,8 @@ def encode_message(message):
 
 
 def post(message, generation, session=None, protocol=None, notification=False,
-         body=None):
-    validate_controller(generation)
+         body=None, controller_ready=True):
+    validate_controller(generation, ready=controller_ready)
     headers = {"Accept": "application/json, text/event-stream",
                "Content-Type": "application/json"}
     if session:
@@ -575,7 +624,7 @@ def post(message, generation, session=None, protocol=None, notification=False,
         fail(f"MCP HTTP {label} {exc.code}: {detail}")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         fail(f"MCP request failed: {exc}")
-    validate_controller(generation)
+    validate_controller(generation, ready=controller_ready)
     if notification:
         if status != 202 or response_body:
             fail("initialized notification did not return empty HTTP 202")
@@ -684,6 +733,143 @@ def valid_call(value):
             and ("isError" not in value or type(value["isError"]) is bool))
 
 
+def require_tools(result, label, required):
+    names = {tool["name"] for tool in result["tools"]}
+    missing = required - names
+    if missing:
+        fail(f"{label} omitted required tools: {', '.join(sorted(missing))}")
+
+
+def controller_startup(arguments):
+    if len(arguments) != 3:
+        fail("internal controller startup usage error")
+    try:
+        pid = int(arguments[0])
+    except ValueError:
+        fail("controller PID is invalid")
+    if (pid != os.getppid()
+            or arguments[1:] != [mcp_url(), cdp_endpoint()]):
+        fail("controller startup identity mismatch")
+    with lock("execution.lock"):
+        with lock("state.lock"):
+            controller = read_controller()
+            if (controller["phase"] != "starting"
+                    or controller["pid"] != pid):
+                fail("controller is not the registered starting process")
+        parsed = urllib.parse.urlsplit(controller["mcp_url"])
+        deadline = time.monotonic() + duration(
+            os.getenv("BROWSERCTL_STARTUP_TIMEOUT", "30"),
+            "startup timeout", .1, 300)
+        while not owns_listener(pid, parsed.hostname, parsed.port):
+            if not controller_alive(controller):
+                fail("registered starting controller died before listening")
+            if time.monotonic() >= deadline:
+                fail("timed out waiting for the exact MCP listener")
+            time.sleep(.05)
+        validate_controller(controller["generation"], ready=False)
+
+        identifier = 1
+        response, session = post({
+            "jsonrpc": "2.0", "id": identifier, "method": "initialize",
+            "params": {"protocolVersion": PROTOCOL, "capabilities": {},
+                       "clientInfo": {
+                           "name": "browserctl-anchor", "version": "3.0"}}},
+            controller["generation"], controller_ready=False)
+        result, error = check(
+            response, "anchor initialize", identifier, valid_init)
+        if error:
+            fail(f"anchor initialize error: {json.dumps(error)}")
+        post({"jsonrpc": "2.0", "method": "notifications/initialized",
+              "params": {}}, controller["generation"], session, PROTOCOL,
+             True, controller_ready=False)
+
+        identifier = 2
+        response, _ = post({
+            "jsonrpc": "2.0", "id": identifier, "method": "tools/list",
+            "params": {}}, controller["generation"], session, PROTOCOL,
+            controller_ready=False)
+        tools, error = check(
+            response, "anchor tools/list", identifier, valid_tools)
+        if error:
+            fail(f"anchor tools/list error: {json.dumps(error)}")
+        require_tools(
+            tools, "anchor tools/list", {"browser_tabs", "browser_get_config"})
+
+        identifier = 3
+        response, _ = post({
+            "jsonrpc": "2.0", "id": identifier, "method": "tools/call",
+            "params": {"name": "browser_get_config", "arguments": {}}},
+            controller["generation"], session, PROTOCOL,
+            controller_ready=False)
+        value, error = check(
+            response, "anchor browser_get_config", identifier, valid_call)
+        if error or value.get("isError"):
+            fail("anchor browser_get_config failed: "
+                 f"{json.dumps(error or value)}")
+        texts = [block["text"] for block in value["content"]
+                 if block["type"] == "text"]
+        prefix = "### Result\n"
+        if len(texts) != 1 or not texts[0].startswith(prefix):
+            fail("anchor browser_get_config returned ambiguous text")
+        try:
+            config = json.loads(
+                texts[0][len(prefix):], parse_constant=reject_constant)
+        except json.JSONDecodeError as exc:
+            fail(f"anchor browser_get_config returned malformed JSON: {exc}")
+        validate_json(config)
+        browser = config.get("browser") if isinstance(config, dict) else None
+        if (not isinstance(browser, dict)
+                or config.get("sharedBrowserContext") is not True
+                or config.get("capabilities") != ["config"]
+                or config.get("extension") not in (None, False)
+                or browser.get("browserName") != "chromium"
+                or browser.get("cdpEndpoint") != controller["cdp_endpoint"]
+                or browser.get("isolated") not in (None, False)
+                or browser.get("userDataDir")
+                or browser.get("remoteEndpoint")
+                or browser.get("initPage")
+                or browser.get("initScript")):
+            fail("anchor config does not match shared CDP controller identity")
+        context = browser.get("contextOptions")
+        if (not isinstance(context, dict)
+                or set(context) - {"viewport"}
+                or context.get("viewport") not in (
+                    None, {"width": 1280, "height": 720})):
+            fail("anchor config contains context-mutating options")
+        validate_controller(controller["generation"], ready=False)
+        controller.update({
+            "phase": "ready", "ready_at": time.time(),
+            "anchor_session_id": session,
+            "anchor_protocol_version": PROTOCOL,
+            "anchor_next_request_id": 4,
+        })
+        with lock("state.lock"):
+            write_controller(controller)
+
+
+def validate_anchor(controller):
+    with lock("state.lock"):
+        current = read_controller()
+        if (current["phase"] != "ready"
+                or current["generation"] != controller["generation"]
+                or current["anchor_session_id"]
+                != controller["anchor_session_id"]):
+            fail("registered ready anchor changed")
+        identifier = current["anchor_next_request_id"]
+        current["anchor_next_request_id"] += 1
+        write_controller(current)
+    response, _ = post({
+        "jsonrpc": "2.0", "id": identifier, "method": "tools/list",
+        "params": {}}, current["generation"], current["anchor_session_id"],
+        current["anchor_protocol_version"])
+    tools, error = check(response, "anchor health", identifier, valid_tools)
+    if error:
+        fail(f"anchor health error: {json.dumps(error)}")
+    require_tools(
+        tools, "anchor health", {"browser_tabs", "browser_get_config"})
+    return current
+
+
 def operation(kind, method, request_id):
     return {"kind": kind, "method": method, "request_id": request_id,
             "started_at": time.time()}
@@ -728,8 +914,7 @@ def initialize(lease):
     tools, error = check(response, "acquire tools/list", identifier, valid_tools)
     if error:
         fail(f"acquire tools/list error: {json.dumps(error)}")
-    if not any(tool["name"] == "browser_tabs" for tool in tools["tools"]):
-        fail("acquire tools/list omitted browser_tabs")
+    require_tools(tools, "acquire tools/list", {"browser_tabs"})
     identifier = persist_operation(lease, "tools/call browser_tabs")
     response, _ = post({
         "jsonrpc": "2.0", "id": identifier, "method": "tools/call",
@@ -759,7 +944,7 @@ def new_lease(owner, controller):
             "session_id": None, "protocol_version": None, "next_request_id": 1,
             "client": client(), "operation": operation(
                 "request", "initialize", 1),
-            "receipt": None, "reason": None}
+            "receipt": None, "reason": None, "snapshot_ready": False}
 
 
 def display(lease):
@@ -794,6 +979,7 @@ def acquire(owner, wait):
                     held, phase = existing["owner"], display(existing)
                     continue
                 controller = validate_controller()
+                controller = validate_anchor(controller)
                 lease = new_lease(owner, controller)
                 with lock("state.lock"):
                     if read_lease(True) is not None:
@@ -822,6 +1008,9 @@ def status():
     with lock("state.lock"):
         lease = read_lease(True)
         if lease is None:
+            controller = validate_controller()
+            validate_config(
+                controller["cdp_endpoint"], controller["mcp_url"])
             value = {"state": "available", "available": True}
         else:
             validate_config(lease["cdp_endpoint"], lease["mcp_url"])
@@ -904,13 +1093,38 @@ def result():
         raise SystemExit(pending["exit_code"])
 
 
+def has_ref_target(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if (key in REF_TARGET_KEYS and isinstance(item, str)
+                    and re.fullmatch(r"(?:f\d+)?e\d+", item)):
+                return True
+            if has_ref_target(item):
+                return True
+    elif isinstance(value, list):
+        return any(has_ref_target(item) for item in value)
+    return False
+
+
+def invalidates_snapshot(name, arguments):
+    return (name in INVALIDATE_TOOLS
+            or name == "browser_tabs"
+            and arguments.get("action") in {"select", "new", "close"})
+
+
 def call(name=None, arguments=None):
     listing = name is None
+    if not listing and name in FORBIDDEN_TOOLS:
+        fail(f"tool {name!r} is forbidden by browserctl")
     with lock("execution.lock"):
         with lock("state.lock"):
             lease = read_lease()
             require_ready(lease)
             validate_config(lease["cdp_endpoint"], lease["mcp_url"])
+            if (not listing and not lease["snapshot_ready"]
+                    and has_ref_target(arguments)):
+                fail("snapshot reference targets require a successful "
+                     "browser_snapshot in this lease")
             try:
                 validate_controller(lease["controller_generation"],
                                     lease["cdp_endpoint"], lease["mcp_url"])
@@ -924,6 +1138,8 @@ def call(name=None, arguments=None):
             message = {"jsonrpc": "2.0", "id": identifier,
                        "method": method, "params": params}
             body = encode_message(message)
+            if not listing and invalidates_snapshot(name, arguments):
+                lease["snapshot_ready"] = False
             lease.update({"phase": "in_progress", "client": client(),
                           "next_request_id": identifier + 1,
                           "operation": operation(
@@ -935,6 +1151,10 @@ def call(name=None, arguments=None):
             lease["protocol_version"], body=body)
         value, rpc_error = check(
             response, method, identifier, valid_tools if listing else valid_call)
+        if listing and not rpc_error:
+            value["tools"] = [
+                tool for tool in value["tools"]
+                if tool["name"] not in FORBIDDEN_TOOLS]
         if rpc_error:
             pending = receipt(
                 identifier, operation_name, "",
@@ -953,6 +1173,9 @@ def call(name=None, arguments=None):
             if (current["phase"] != "in_progress"
                     or current["operation"]["request_id"] != identifier):
                 fail("in-progress state changed unexpectedly")
+            if (not listing and name == "browser_snapshot"
+                    and not rpc_error and not value.get("isError")):
+                current["snapshot_ready"] = True
             current.update({"phase": "result_pending", "client": None,
                             "operation": None, "receipt": pending})
             write_lease(current)
@@ -1012,12 +1235,19 @@ def recover():
                     or controller["mcp_url"] != lease["mcp_url"]):
                 fail("recovery controller does not use the same endpoints")
             old = lease["controller_generation"]
+        validate_anchor(controller)
+        with lock("state.lock"):
+            lease = read_lease()
+            if (lease["controller_generation"] != old
+                    or display(lease) not in {"ready", "recovery_required"}):
+                fail("lease changed during recovery validation")
             lease.update({"phase": "initializing",
                           "controller_generation": controller["generation"],
                           "session_id": None, "protocol_version": None,
                           "next_request_id": 1, "client": client(),
                           "operation": operation("request", "initialize", 1),
-                          "receipt": None, "reason": None})
+                          "receipt": None, "reason": None,
+                          "snapshot_ready": False})
             write_lease(lease)
         try:
             lease = initialize(lease)
@@ -1065,6 +1295,8 @@ def main():
         fail("outer timeout must exceed HTTP timeout")
     if sys.argv[1:3] == ["controller", "register"]:
         register(sys.argv[3:])
+    elif sys.argv[1:3] == ["controller", "startup"]:
+        controller_startup(sys.argv[3:])
     elif sys.argv[1:2] == ["lease"]:
         lease_command(sys.argv[2:])
     elif sys.argv[1:] == ["list"]:

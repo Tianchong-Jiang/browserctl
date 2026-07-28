@@ -1,0 +1,11 @@
+[Unit]
+Description=browserctl Playwright controller
+
+[Service]
+Type=notify
+NotifyAccess=all
+TimeoutStartSec=infinity
+EnvironmentFile=%h/.config/browserctl/controller.env
+WorkingDirectory=%h/workspace/browserctl
+ExecStart=%h/workspace/browserctl/start-controller.sh
+Restart=no
