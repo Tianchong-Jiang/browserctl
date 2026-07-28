@@ -1,238 +1,251 @@
 #!/usr/bin/env python3
-"""Isolated cross-process tests for browserctl."""
+"""Deterministic adversarial tests; no human browser is contacted."""
 
 import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-import urllib.parse
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).parent
 CLIENT = ROOT / "client.sh"
 PYTHON_CLIENT = ROOT / "mcp_client.py"
+CDP = "http://127.0.0.1:49333"
 
 
-def run_fake_server(state_dir, port_file, event_file, mode="healthy"):
-    class FakeMCP(BaseHTTPRequestHandler):
-        delete_status = 200
-        active = 0
-        selected_tabs = {}
-        mutex = threading.Lock()
+def fake_server(state_dir, port, ready_file, event_file, mode):
+    sessions = {}
+    active = 0
+    mutex = threading.Lock()
 
+    class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
 
         def event(self, kind, **values):
-            entry = {"kind": kind, "at": time.monotonic(), **values}
-            with self.mutex:
+            with mutex:
                 with open(event_file, "a", encoding="utf-8") as stream:
-                    stream.write(json.dumps(entry) + "\n")
+                    stream.write(json.dumps({"kind": kind, **values}) + "\n")
+
+        def reply(self, status, body=b"", session=None, content_type=None):
+            self.send_response(status)
+            if content_type:
+                self.send_header("Content-Type", content_type)
+            if session:
+                self.send_header("Mcp-Session-Id", session)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except BrokenPipeError:
+                pass
 
         def do_POST(self):
-            body = self.rfile.read(int(self.headers["Content-Length"]))
-            message = json.loads(body)
-            method = message["method"]
-            name = message.get("params", {}).get("name")
-            arguments = message.get("params", {}).get("arguments", {})
-            session = self.headers.get("Mcp-Session-Id")
-            self.event(
-                "post", method=method, name=name, session=session,
-                request_id=message.get("id"))
-            if method == "notifications/initialized":
-                payload, status = b"accepted", 202
-            elif method == "initialize":
-                payload, status = json.dumps({
-                    "jsonrpc": "2.0", "id": message["id"], "result": {}
-                }).encode(), 200
-            else:
-                with self.mutex:
-                    type(self).active += 1
-                    active = type(self).active
-                lease = json.loads(
-                    (Path(state_dir) / "lease.json").read_text(
-                        encoding="utf-8"))
-                self.event(
-                    "operation_start", method=method, name=name, active=active,
-                    in_flight_id=lease.get("in_flight", {}).get("id"))
-                if method == "tools/call":
-                    if name == "slow":
-                        time.sleep(0.35)
-                    elif name == "long":
-                        time.sleep(5.2)
-                    elif name and name.startswith("delete_"):
-                        type(self).delete_status = int(name.removeprefix("delete_"))
-                if method == "tools/call" and name == "malformed_result":
-                    result = {"content": "not-a-list"}
-                elif method == "tools/call" and name == "missing_text":
-                    result = {"content": [{"type": "text"}]}
-                elif method == "tools/call" and name == "unknown_content_type":
-                    result = {"content": [{"type": "bogus"}]}
-                elif (method == "tools/call" and name == "browser_tabs"
-                      and arguments.get("action") == "select"):
-                    type(self).selected_tabs[session] = arguments.get("index")
-                    result = {
-                        "content": [{
-                            "type": "text",
-                            "text": f"selected tab {arguments.get('index')}",
-                        }],
-                    }
-                elif method == "tools/call" and name == "browser_snapshot":
-                    result = {
-                        "content": [{
-                            "type": "text",
-                            "text": (
-                                "snapshot tab "
-                                f"{type(self).selected_tabs.get(session, 0)}"
-                            ),
-                        }],
-                    }
-                elif method == "tools/call":
-                    result = {
-                        "content": [{"type": "text", "text": "fake"}],
-                        "isError": (
-                            name == "error"
-                            or (mode == "bad_browser" and name == "browser_tabs")
-                        ),
-                    }
-                else:
-                    result = (
-                        {"not_tools": []}
-                        if mode == "bad_health"
-                        else {"tools": []}
-                    )
-                if method == "tools/call" and name == "rpc_error":
-                    payload = json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": message["id"],
-                        "error": {
-                            "code": -32000,
-                            "message": "fake RPC error",
-                        },
-                    }).encode()
-                else:
-                    payload = json.dumps({
-                        "jsonrpc": "2.0",
-                        "id": 999 if name == "wrong_id" else message["id"],
-                        "result": result,
-                    }).encode()
-                status = 200
-                with self.mutex:
-                    type(self).active -= 1
-                    active = type(self).active
-                self.event("operation_end", method=method, name=name, active=active)
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Mcp-Session-Id", "fake-session")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
+            nonlocal active
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
             try:
-                self.wfile.write(payload)
-            except BrokenPipeError:
-                pass
+                message = json.loads(body)
+            except json.JSONDecodeError:
+                return self.reply(400, b"bad json")
+            method = message.get("method")
+            params = message.get("params", {})
+            name = params.get("name")
+            arguments = params.get("arguments", {})
+            session = self.headers.get("Mcp-Session-Id")
+            self.event("post", method=method, name=name, session=session,
+                       request_id=message.get("id"),
+                       protocol=self.headers.get("Mcp-Protocol-Version"))
+            if name == "redirect":
+                self.send_response(307)
+                self.send_header("Location", "http://127.0.0.1:1/mcp")
+                self.end_headers()
+                return
+            if method == "initialize":
+                session = f"session-{os.getpid()}-{len(sessions) + 1}"
+                sessions[session] = {"tab": 0}
+                result = {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fake", "version": "1"},
+                }
+                payload = {"jsonrpc": "2.0", "id": message["id"],
+                           "result": result}
+                return self.reply(
+                    200, json.dumps(payload).encode(), session,
+                    "application/json")
+            if session not in sessions:
+                return self.reply(404, b"Session not found")
+            if self.headers.get("Mcp-Protocol-Version") != "2025-03-26":
+                return self.reply(400, b"bad protocol")
+            if method == "notifications/initialized":
+                return self.reply(202)
+
+            with mutex:
+                active += 1
+                count = active
+            self.event("start", method=method, name=name, session=session,
+                       active=count)
+            try:
+                if name == "slow":
+                    time.sleep(.5)
+                elif name == "hang":
+                    time.sleep(10)
+                if method == "tools/list":
+                    if mode == "bad_tools_schema":
+                        result = {"tools": "bad"}
+                    else:
+                        names = [] if mode == "no_browser_tabs" else ["browser_tabs"]
+                        result = {"tools": [
+                            {"name": item, "inputSchema": {"type": "object"}}
+                            for item in names]}
+                elif name == "browser_tabs" and arguments.get("action") == "list":
+                    text = "" if mode == "empty_health" else (
+                        f"- 0: tab {sessions[session]['tab']}")
+                    result = {"content": [{"type": "text", "text": text}]}
+                elif name == "browser_tabs" and arguments.get("action") == "select":
+                    sessions[session]["tab"] = arguments["index"]
+                    result = {"content": [
+                        {"type": "text", "text": f"selected {arguments['index']}"}]}
+                elif name == "browser_snapshot":
+                    result = {"content": [{"type": "text",
+                                           "text": f"snapshot tab {sessions[session]['tab']}"}]}
+                elif name == "malformed":
+                    result = {"content": "bad"}
+                elif name == "big":
+                    result = {"content": [{"type": "text", "text": "x" * 200_000}]}
+                elif name == "large_receipt":
+                    result = {"content": [
+                        {"type": "text", "text": "xxxxxxxxxx"}
+                        for _ in range(271_000)]}
+                elif name == "surrogate":
+                    result = {"content": [{"type": "text", "text": "\ud800"}]}
+                elif name == "overflow_number":
+                    result = {
+                        "content": [{"type": "text", "text": "ok"}],
+                        "structuredContent": {"x": "__OVERFLOW__"}}
+                else:
+                    result = {"content": [{"type": "text", "text": "ok"}],
+                              "isError": name == "tool_error"}
+                if name == "rpc_error":
+                    payload = {"jsonrpc": "2.0", "id": message["id"],
+                               "error": {"code": -32000, "message": "fake"}}
+                else:
+                    payload = {"jsonrpc": "2.0",
+                               "id": 999 if name == "wrong_id" else message["id"],
+                               "result": result}
+                if name == "replace_generation":
+                    path = Path(state_dir) / "controller.json"
+                    controller = json.loads(path.read_text())
+                    controller["generation"] = "f" * 32
+                    path.write_text(json.dumps(controller))
+                    path.chmod(0o600)
+                response_session = "wrong-session" if name == "wrong_session" else session
+                encoded = json.dumps(payload)
+                if name == "overflow_number":
+                    encoded = encoded.replace('"__OVERFLOW__"', "1e999")
+                self.reply(200, encoded.encode(), response_session,
+                           "application/json")
+            finally:
+                with mutex:
+                    active -= 1
+                    count = active
+                self.event("end", method=method, name=name, active=count)
 
         def do_DELETE(self):
-            self.event(
-                "delete",
-                session=self.headers.get("Mcp-Session-Id"),
-                protocol=self.headers.get("Mcp-Protocol-Version"),
-            )
-            status = type(self).delete_status
-            if status == 200:
-                type(self).selected_tabs.pop(
-                    self.headers.get("Mcp-Session-Id"), None)
-            payload = b"" if status == 200 else b"delete refused"
-            self.send_response(status)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            try:
-                self.wfile.write(payload)
-            except BrokenPipeError:
-                pass
+            session = self.headers.get("Mcp-Session-Id")
+            self.event("delete", session=session,
+                       protocol=self.headers.get("Mcp-Protocol-Version"))
+            if mode == "delete_hang":
+                time.sleep(10)
+            if mode == "delete_500":
+                return self.reply(500, b"refused")
+            if session not in sessions:
+                return self.reply(404, b"Session not found")
+            del sessions[session]
+            self.reply(200)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeMCP)
+    server = ThreadingHTTPServer(("127.0.0.1", int(port)), Handler)
     server.daemon_threads = True
-    FakeMCP.delete_status = 500 if mode == "bad_delete" else 200
-    FakeMCP.selected_tabs = {}
     url = f"http://127.0.0.1:{server.server_port}/mcp"
     env = os.environ.copy()
     env.update({
         "BROWSERCTL_STATE_DIR": state_dir,
         "BROWSERCTL_MCP_URL": url,
-        "BROWSERCTL_HTTP_TIMEOUT": "2",
+        "BROWSERCTL_CDP_ENDPOINT": CDP,
         "BROWSERCTL_CONTROLLER_HOST": "127.0.0.1",
         "BROWSERCTL_CONTROLLER_PORT": str(server.server_port),
     })
     subprocess.run(
-        [PYTHON_CLIENT, "controller", "register", str(os.getpid()), url],
+        [PYTHON_CLIENT, "controller", "register", str(os.getpid()), url, CDP],
         env=env, check=True)
-    Path(port_file).write_text(str(server.server_port), encoding="ascii")
+    Path(ready_file).write_text(str(server.server_port))
     server.serve_forever()
 
 
 class BrowserctlTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="browserctl-test-")
-        self.state = Path(self.temporary.name) / "state"
-        self.state.mkdir()
-        self.port_file = Path(self.temporary.name) / "port"
-        self.event_file = Path(self.temporary.name) / "events"
+        self.temp = tempfile.TemporaryDirectory(prefix="browserctl-test-")
+        self.state = Path(self.temp.name) / "state"
+        self.state.mkdir(mode=0o700)
+        self.ready = Path(self.temp.name) / "ready"
+        self.events_file = Path(self.temp.name) / "events"
         self.env = os.environ.copy()
         self.env.update({
             "BROWSERCTL_STATE_DIR": str(self.state),
+            "BROWSERCTL_CDP_ENDPOINT": CDP,
             "BROWSERCTL_HTTP_TIMEOUT": "2",
+            "BROWSERCTL_LOCK_TIMEOUT": "2",
         })
         self.server = None
+        self.port = 0
         self.start_server()
 
     def tearDown(self):
         self.stop_server()
-        self.temporary.cleanup()
+        self.temp.cleanup()
 
     def start_server(self, mode="healthy"):
-        self.port_file.unlink(missing_ok=True)
+        self.ready.unlink(missing_ok=True)
         self.server = subprocess.Popen(
-            [
-                sys.executable, __file__, "--fake-server",
-                str(self.state), str(self.port_file), str(self.event_file), mode,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+            [sys.executable, __file__, "--fake-server", str(self.state),
+             str(self.port), str(self.ready), str(self.events_file), mode],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            if self.port_file.exists():
+            if self.ready.exists():
                 try:
-                    port = int(self.port_file.read_text(encoding="ascii"))
+                    self.port = int(self.ready.read_text())
                 except ValueError:
                     pass
                 else:
                     self.env["BROWSERCTL_MCP_URL"] = (
-                        f"http://127.0.0.1:{port}/mcp")
+                        f"http://127.0.0.1:{self.port}/mcp")
                     return
             if self.server.poll() is not None:
                 _, error = self.server.communicate()
-                self.fail(f"fake controller failed to start: {error}")
-            time.sleep(0.01)
-        self.fail("fake controller did not publish its port")
+                self.fail(f"fake server failed: {error}")
+            time.sleep(.01)
+        self.fail("fake server did not start")
 
     def stop_server(self):
-        if self.server is None:
+        if not self.server:
             return
         if self.server.poll() is None:
-            self.server.send_signal(signal.SIGTERM)
+            self.server.terminate()
             try:
-                self.server.wait(timeout=2)
+                self.server.wait(2)
             except subprocess.TimeoutExpired:
                 self.server.kill()
-                self.server.wait(timeout=2)
+                self.server.wait(2)
         self.server.stdout.close()
         self.server.stderr.close()
         self.server = None
@@ -241,638 +254,471 @@ class BrowserctlTests(unittest.TestCase):
         self.stop_server()
         self.start_server(mode)
 
-    def events(self):
-        if not self.event_file.exists():
-            return []
-        return [
-            json.loads(line)
-            for line in self.event_file.read_text(encoding="utf-8").splitlines()
-        ]
-
-    def run_client(self, *arguments, check=True, env_updates=None):
-        env = self.env.copy()
-        if env_updates:
-            env.update(env_updates)
+    def run_client(self, *args, check=True, env=None, **kwargs):
+        merged = self.env.copy()
+        if env:
+            merged.update(env)
         return subprocess.run(
-            [CLIENT, *arguments], env=env, text=True, capture_output=True,
-            check=check)
+            [CLIENT, *args], env=merged, text=True, capture_output=True,
+            check=check, **kwargs)
 
-    def run_sequence(self, calls, check=True, env_updates=None):
-        return self.run_client(
-            "sequence", json.dumps(calls), check=check,
-            env_updates=env_updates)
+    def acquire(self, owner="test"):
+        return json.loads(self.run_client("lease", "acquire", owner).stdout)
 
-    def acquire(self, owner="test", wait="0", ttl="5"):
-        return json.loads(self.run_client(
-            "lease", "acquire", owner, wait, ttl).stdout)
+    def status(self):
+        return json.loads(self.run_client("lease", "status").stdout)
 
-    def wait_for_tool(self, name, timeout=2):
+    def events(self, kind=None):
+        if not self.events_file.exists():
+            return []
+        values = [json.loads(line) for line in self.events_file.read_text().splitlines()]
+        return [item for item in values if item["kind"] == kind] if kind else values
+
+    def wait_event(self, name, timeout=2):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if any(
-                event["kind"] == "operation_start" and event.get("name") == name
-                for event in self.events()
-            ):
+            if any(item["kind"] == "start" and item.get("name") == name
+                   for item in self.events()):
                 return
-            time.sleep(0.01)
-        self.fail(f"tool {name!r} did not enter fake controller")
+            time.sleep(.01)
+        self.fail(f"no event for {name}")
 
-    def quarantine_with_timeout(self, ttl="5"):
-        self.acquire(ttl=ttl)
-        result = self.run_client(
-            "call", "slow", "{}", check=False,
-            env_updates={"BROWSERCTL_HTTP_TIMEOUT": "0.05"})
-        self.assertNotEqual(result.returncode, 0)
-        return result
+    def kill_in_flight(self, name="hang"):
+        self.acquire()
+        process = subprocess.Popen(
+            [sys.executable, PYTHON_CLIENT, "call", name, "{}"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.wait_event(name)
+        process.kill()
+        process.wait(2)
+        process.stdout.close()
+        process.stderr.close()
+        return process
 
-    def test_acquire_use_renew_release_across_processes(self):
+    def test_persistent_session_cross_process_and_release(self):
         acquired = self.acquire()
-        self.assertEqual(acquired["owner"], "test")
-        self.assertTrue(acquired["acquired"])
-        self.assertNotIn("token", acquired)
-        self.run_client("list")
-        self.run_client("lease", "renew", "5")
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "held")
-        self.assertFalse(status["expired"])
-        self.assertFalse(status["in_flight"])
-        self.assertFalse(status["recovery_required"])
+        session = acquired["session_id"]
+        self.run_client("call", "browser_tabs", '{"action":"select","index":7}')
+        snapshot = json.loads(self.run_client(
+            "call", "browser_snapshot", "{}").stdout)
+        self.assertEqual(snapshot["content"][0]["text"], "snapshot tab 7")
+        posts = self.events("post")
+        self.assertEqual(sum(item["method"] == "initialize" for item in posts), 1)
+        requests = [item for item in posts if item["request_id"] is not None]
+        self.assertEqual([item["request_id"] for item in requests],
+                         [1, 2, 3, 4, 5])
+        self.assertEqual({item["session"] for item in posts
+                          if item["method"] == "tools/call"}, {session})
+        self.assertTrue(all(
+            item["protocol"] == "2025-03-26" for item in posts
+            if item["method"] != "initialize"))
         self.run_client("lease", "release")
-        rejected = self.run_client("list", check=False)
-        self.assertNotEqual(rejected.returncode, 0)
-        self.assertEqual(os.stat(self.state).st_mode & 0o777, 0o700)
-        for path in self.state.iterdir():
-            self.assertEqual(path.lstat().st_mode & 0o777, 0o600)
-
-    def test_token_environment_is_unneeded_and_ignored(self):
-        self.acquire()
-        self.run_client(
-            "list", env_updates={"BROWSERCTL_LEASE_TOKEN": "wrong-old-token"})
-        self.run_client(
-            "lease", "renew",
-            env_updates={"BROWSERCTL_LEASE_TOKEN": "another-value"})
-        self.run_client(
-            "lease", "release",
-            env_updates={"BROWSERCTL_LEASE_TOKEN": "ignored"})
-
-    def test_loopback_http_ignores_ambient_proxy(self):
-        self.acquire()
-        self.run_client("list", env_updates={
-            "HTTP_PROXY": "http://127.0.0.1:1",
-            "HTTPS_PROXY": "http://127.0.0.1:1",
-            "ALL_PROXY": "http://127.0.0.1:1",
-            "NO_PROXY": "",
-            "no_proxy": "",
-        })
-
-    def test_commands_require_active_singleton_lease_before_mcp(self):
-        before = len(self.events())
-        result = self.run_client("list", check=False)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("no active singleton lease", result.stderr)
-        self.assertEqual(len(self.events()), before)
-
-    def test_nonempty_notification_response_is_ignored(self):
-        self.acquire()
-        result = self.run_client("list")
-        self.assertEqual(json.loads(result.stdout), {"tools": []})
-
-    def test_long_tool_survives_heartbeat_window_and_deletes_session(self):
-        self.acquire(ttl="8")
-        result = self.run_client(
-            "call", "long", "{}",
-            env_updates={"BROWSERCTL_HTTP_TIMEOUT": "7", "BROWSERCTL_TIMEOUT": "8"})
-        self.assertFalse(json.loads(result.stdout)["isError"])
-        deletes = [event for event in self.events() if event["kind"] == "delete"]
-        self.assertEqual(deletes[-1]["session"], "fake-session")
+        deletes = self.events("delete")
+        self.assertEqual(deletes[-1]["session"], session)
         self.assertEqual(deletes[-1]["protocol"], "2025-03-26")
+        request = urllib.request.Request(
+            self.env["BROWSERCTL_MCP_URL"],
+            json.dumps({"jsonrpc": "2.0", "id": 99,
+                        "method": "tools/list", "params": {}}).encode(),
+            {"Content-Type": "application/json", "Mcp-Session-Id": session,
+             "Mcp-Protocol-Version": "2025-03-26"}, method="POST")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request)
+        self.assertEqual(caught.exception.code, 404)
 
-    def test_sequence_select_and_snapshot_share_one_session(self):
+    def test_no_expiry_or_renew_interface(self):
         self.acquire()
-        result = json.loads(self.run_sequence([
-            {
-                "name": "browser_tabs",
-                "arguments": {"action": "select", "index": 1},
-            },
-            {"name": "browser_snapshot", "arguments": {}},
-        ]).stdout)
-        self.assertEqual(len(result), 2)
-        self.assertEqual(
-            result[1]["content"][0]["text"], "snapshot tab 1")
-        events = self.events()
-        initializes = [
-            event for event in events
-            if event["kind"] == "post" and event["method"] == "initialize"
-        ]
-        calls = [
-            event for event in events
-            if event["kind"] == "post" and event["method"] == "tools/call"
-        ]
-        deletes = [event for event in events if event["kind"] == "delete"]
-        self.assertEqual(len(initializes), 1)
-        self.assertEqual(
-            [call["name"] for call in calls],
-            ["browser_tabs", "browser_snapshot"])
-        self.assertEqual([call["request_id"] for call in calls], [2, 3])
-        self.assertEqual(
-            {call["session"] for call in calls}, {"fake-session"})
-        starts = [
-            event for event in events
-            if event["kind"] == "operation_start"
-            and event["method"] == "tools/call"
-        ]
-        self.assertEqual(len({start["in_flight_id"] for start in starts}), 1)
-        self.assertIsNotNone(starts[0]["in_flight_id"])
-        self.assertEqual(len(deletes), 1)
-        self.assertEqual(deletes[0]["session"], "fake-session")
-
-    def assert_ambiguous_sequence_quarantines(self, tool, error_text):
-        self.acquire()
-        failed = self.run_sequence([
-            {"name": "ok", "arguments": {}},
-            {"name": tool, "arguments": {}},
-            {"name": "not_sent", "arguments": {}},
-        ], check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn(error_text, failed.stderr)
-        calls = [
-            event for event in self.events()
-            if event["kind"] == "operation_start"
-            and event.get("method") == "tools/call"
-        ]
-        self.assertEqual([call["name"] for call in calls], ["ok", tool])
-        self.assertFalse(any(
-            event["kind"] == "delete" for event in self.events()))
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "recovery_required")
-
-    def test_sequence_malformed_result_quarantines(self):
-        self.assert_ambiguous_sequence_quarantines(
-            "malformed_result", "malformed sequence item 2 tools/call result")
-
-    def test_sequence_wrong_id_quarantines(self):
-        self.assert_ambiguous_sequence_quarantines(
-            "wrong_id", "mismatched sequence item 2 tools/call")
-
-    def test_sequence_first_tool_error_is_determinate(self):
-        self.acquire()
-        failed = self.run_sequence([
-            {"name": "error", "arguments": {}},
-            {"name": "not_sent", "arguments": {}},
-        ], check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn(
-            "Playwright tool error in sequence item 1 tools/call",
-            failed.stderr)
-        calls = [
-            event for event in self.events()
-            if event["kind"] == "operation_start"
-            and event.get("method") == "tools/call"
-        ]
-        self.assertEqual([call["name"] for call in calls], ["error"])
-        self.assertEqual(len([
-            event for event in self.events() if event["kind"] == "delete"
-        ]), 1)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "held")
-
-    def test_sequence_second_rpc_error_is_determinate(self):
-        self.acquire()
-        failed = self.run_sequence([
-            {"name": "ok", "arguments": {}},
-            {"name": "rpc_error", "arguments": {}},
-            {"name": "not_sent", "arguments": {}},
-        ], check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn(
-            "sequence item 2 tools/call JSON-RPC error", failed.stderr)
-        calls = [
-            event for event in self.events()
-            if event["kind"] == "operation_start"
-            and event.get("method") == "tools/call"
-        ]
-        self.assertEqual(
-            [call["name"] for call in calls], ["ok", "rpc_error"])
-        self.assertEqual(len([
-            event for event in self.events() if event["kind"] == "delete"
-        ]), 1)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "held")
-
-    def test_sequence_second_tool_error_is_determinate(self):
-        self.acquire()
-        failed = self.run_sequence([
-            {"name": "ok", "arguments": {}},
-            {"name": "error", "arguments": {}},
-            {"name": "not_sent", "arguments": {}},
-        ], check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn(
-            "Playwright tool error in sequence item 2 tools/call",
-            failed.stderr)
-        calls = [
-            event for event in self.events()
-            if event["kind"] == "operation_start"
-            and event.get("method") == "tools/call"
-        ]
-        self.assertEqual([call["name"] for call in calls], ["ok", "error"])
-        self.assertEqual(len([
-            event for event in self.events() if event["kind"] == "delete"
-        ]), 1)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "held")
-
-    def test_sequence_second_timeout_quarantines(self):
-        self.acquire()
-        failed = self.run_sequence([
-            {"name": "ok", "arguments": {}},
-            {"name": "slow", "arguments": {}},
-            {"name": "not_sent", "arguments": {}},
-        ], check=False, env_updates={"BROWSERCTL_HTTP_TIMEOUT": "0.05"})
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn("MCP request failed", failed.stderr)
-        self.assertFalse(any(
-            event["kind"] == "delete" for event in self.events()))
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "recovery_required")
-
-    def test_sequence_delete_failure_quarantines(self):
-        self.acquire()
-        failed = self.run_sequence([
-            {"name": "ok", "arguments": {}},
-            {"name": "delete_405", "arguments": {}},
-        ], check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn("DELETE HTTP 405", failed.stderr)
-        self.assertEqual(len([
-            event for event in self.events() if event["kind"] == "delete"
-        ]), 1)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "recovery_required")
-
-    def test_sequence_input_is_strict_and_bounded(self):
-        self.acquire()
-        calls = [{"name": "ok", "arguments": {}} for _ in range(10)]
-        self.assertEqual(len(json.loads(self.run_sequence(calls).stdout)), 10)
-        before = len([
-            event for event in self.events() if event["kind"] == "post"
-        ])
-        invalid = (
-            [],
-            calls + [{"name": "overflow", "arguments": {}}],
-            {"name": "not-an-array", "arguments": {}},
-            [1],
-            [{"name": "ok", "arguments": {}, "extra": True}],
-            [{"name": "ok", "arguments": []}],
-            [{"name": "", "arguments": {}}],
-            [{"command": "lease", "arguments": {"action": "release"}}],
-        )
-        for value in invalid:
-            with self.subTest(value=value):
-                failed = self.run_client(
-                    "sequence", json.dumps(value), check=False)
-                self.assertNotEqual(failed.returncode, 0)
-        after = len([
-            event for event in self.events() if event["kind"] == "post"
-        ])
-        self.assertEqual(after, before)
-
-    def test_controller_launcher_pins_server_and_registers_generation(self):
-        self.stop_server()
-        fake_bin = Path(self.temporary.name) / "bin"
-        fake_bin.mkdir()
-        fake_npx = fake_bin / "npx"
-        fake_npx.write_text(
-            "#!/bin/sh\n"
-            "printf '%s\\n' \"$PLAYWRIGHT_MCP_PING_TIMEOUT_MS\" \"$@\"\n")
-        fake_npx.chmod(0o700)
-        cases = (
-            ("127.0.0.1", "http://127.0.0.1:47883/mcp",
-             "127.0.0.1:47883"),
-            ("::1", "http://[::1]:47883/mcp", "[::1]:47883"),
-        )
-        for host, url, allowed_host in cases:
-            with self.subTest(host=host):
-                (self.state / "controller.json").unlink(missing_ok=True)
-                result = subprocess.run(
-                    [ROOT / "start-controller.sh"],
-                    env={
-                        **self.env,
-                        "PATH": f"{fake_bin}:{self.env['PATH']}",
-                        "BROWSERCTL_HOST": host,
-                        "BROWSERCTL_PORT": "47883",
-                        "BROWSERCTL_MCP_URL": url,
-                    },
-                    text=True, capture_output=True, check=True)
-                lines = result.stdout.splitlines()
-                self.assertEqual(lines[0], "0")
-                self.assertIn("@playwright/mcp@0.0.78", lines)
-                self.assertEqual(lines[lines.index("--host") + 1], host)
-                self.assertEqual(
-                    lines[lines.index("--allowed-hosts") + 1], allowed_host)
-                self.assertNotIn("*", lines)
-                controller = json.loads(
-                    (self.state / "controller.json").read_text(
-                        encoding="utf-8"))
-                self.assertEqual(controller["schema_version"], 1)
-                self.assertEqual(len(controller["generation"]), 32)
-
-    def assert_delete_error_quarantines(self, status):
-        self.acquire()
-        calls_before = len([
-            event for event in self.events()
-            if event["kind"] == "operation_start"
-            and event.get("method") == "tools/call"
-        ])
-        failed = self.run_client(
-            "call", f"delete_{status}", "{}", check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn(f"DELETE HTTP {status}", failed.stderr)
-        lease_status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(lease_status["state"], "recovery_required")
-        self.assertTrue(lease_status["in_flight"])
-        self.assertNotIn("expires_in", lease_status)
-        blocked = self.run_client("call", "ok", "{}", check=False)
+        time.sleep(.2)
+        self.assertEqual(self.status()["state"], "ready")
+        blocked = self.run_client("lease", "acquire", "other", "0.1", check=False)
         self.assertNotEqual(blocked.returncode, 0)
-        calls = [
-            event for event in self.events()
-            if event["kind"] == "operation_start" and event.get("method") == "tools/call"
-        ]
-        self.assertEqual(len(calls), calls_before + 1)
+        self.assertIn("held", blocked.stderr)
+        renew = self.run_client("lease", "renew", check=False)
+        self.assertNotEqual(renew.returncode, 0)
 
-    def test_delete_405_and_500_quarantine(self):
-        self.assert_delete_error_quarantines(405)
-        self.restart_server()
-        self.run_client("lease", "recover")
-        self.run_client("lease", "release")
-        self.assert_delete_error_quarantines(500)
-
-    def assert_malformed_response_quarantines(self, tool, error_text):
-        self.acquire()
-        deletes_before = len([
-            event for event in self.events() if event["kind"] == "delete"
-        ])
-        failed = self.run_client("call", tool, "{}", check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn(error_text, failed.stderr)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "recovery_required")
-        deletes_after = len([
-            event for event in self.events() if event["kind"] == "delete"
-        ])
-        self.assertEqual(deletes_after, deletes_before)
-
-    def test_malformed_tools_call_result_quarantines(self):
-        self.assert_malformed_response_quarantines(
-            "malformed_result", "malformed tools/call result")
-
-    def test_missing_text_content_quarantines(self):
-        self.assert_malformed_response_quarantines(
-            "missing_text", "malformed tools/call result")
-
-    def test_unknown_content_type_quarantines(self):
-        self.assert_malformed_response_quarantines(
-            "unknown_content_type", "malformed tools/call result")
-
-    def test_wrong_response_id_quarantines(self):
-        self.assert_malformed_response_quarantines(
-            "wrong_id", "malformed or mismatched tools/call JSON-RPC response")
-
-    def test_bounded_contention(self):
-        self.acquire(owner="first")
-        started = time.monotonic()
-        result = self.run_client(
-            "lease", "acquire", "second", "0.2", "5", check=False)
-        elapsed = time.monotonic() - started
-        self.assertNotEqual(result.returncode, 0)
-        self.assertGreaterEqual(elapsed, 0.18)
-        self.assertLess(elapsed, 0.9)
-        self.assertIn("'first'", result.stderr)
-
-    def test_idle_expiry_auto_reclaims(self):
-        self.acquire(owner="old", ttl="0.1")
-        time.sleep(0.15)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "available")
-        self.assertTrue(status["reclaimed_expired_lease"])
-        self.assertFalse(status["expired"])
-        acquired = self.acquire(owner="new")
-        self.assertEqual(acquired["owner"], "new")
-
-    def test_expired_in_flight_never_auto_expires(self):
-        self.quarantine_with_timeout(ttl="0.1")
-        time.sleep(0.15)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "recovery_required")
-        self.assertTrue(status["expired"])
-        self.assertTrue(status["in_flight"])
-        self.assertTrue(status["recovery_required"])
-        self.assertNotIn("expires_in", status)
-        contender = self.run_client(
-            "lease", "acquire", "new", "0.1", "5", check=False)
-        self.assertNotEqual(contender.returncode, 0)
-        self.assertIn("requires recovery", contender.stderr)
-
-    def test_http_and_outer_timeouts_quarantine(self):
-        self.quarantine_with_timeout()
-        blocked = self.run_client("call", "ok", "{}", check=False)
-        self.assertIn("indeterminate in-flight", blocked.stderr)
-        self.restart_server()
-        self.run_client("lease", "recover")
-        outer = self.run_client(
-            "call", "slow", "{}", check=False,
-            env_updates={
-                "BROWSERCTL_HTTP_TIMEOUT": "2",
-                "BROWSERCTL_TIMEOUT": "0.25",
-            })
-        self.assertNotEqual(outer.returncode, 0)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertTrue(status["recovery_required"])
-
-    def test_killed_client_quarantines_before_second_tool(self):
+    def test_execution_exclusion_and_live_status(self):
         self.acquire()
         first = subprocess.Popen(
-            [sys.executable, PYTHON_CLIENT, "call", "slow", "{}"],
-            env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.wait_for_tool("slow")
-        first.kill()
-        first.wait(timeout=1)
-        blocked = self.run_client("call", "ok", "{}", check=False)
+            [CLIENT, "call", "slow", "{}"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.wait_event("slow")
+        status = self.status()
+        self.assertEqual(status["state"], "in_progress")
+        self.assertTrue(status["client_alive"])
+        started = time.monotonic()
+        blocked = self.run_client(
+            "lease", "acquire", "other", "0", check=False)
+        self.assertLess(time.monotonic() - started, .2)
         self.assertNotEqual(blocked.returncode, 0)
-        calls = [
-            event for event in self.events()
-            if event["kind"] == "operation_start"
-            and event.get("method") == "tools/call"
-        ]
-        self.assertEqual([call["name"] for call in calls], ["slow"])
+        self.assertIn("held", blocked.stderr)
+        second = subprocess.Popen(
+            [CLIENT, "call", "browser_snapshot", "{}"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        first.communicate(timeout=2)
+        second.communicate(timeout=2)
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(second.returncode, 0)
+        self.assertTrue(all(item["active"] == 1 for item in self.events("start")))
 
-    def test_release_and_renew_reject_in_flight(self):
-        self.quarantine_with_timeout()
-        for arguments in (("lease", "release"), ("lease", "renew")):
-            result = self.run_client(*arguments, check=False)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("indeterminate in-flight", result.stderr)
+    def test_killed_client_is_recovery_required(self):
+        self.kill_in_flight()
+        status = self.status()
+        self.assertEqual(status["phase"], "in_progress")
+        self.assertEqual(status["state"], "recovery_required")
+        self.assertFalse(status["client_alive"])
+        self.assertNotEqual(
+            self.run_client("lease", "release", check=False).returncode, 0)
 
-    def test_recovery_requires_changed_healthy_generation(self):
-        self.quarantine_with_timeout()
+    def test_wrong_id_session_schema_and_controller_replacement_quarantine(self):
+        for tool, text in (
+            ("wrong_id", "mismatched"),
+            ("wrong_session", "exact session"),
+            ("malformed", "malformed tools/call result"),
+            ("replace_generation", "generation changed"),
+        ):
+            with self.subTest(tool=tool):
+                if (self.state / "lease.json").exists():
+                    self.stop_server()
+                    (self.state / "lease.json").unlink()
+                    (self.state / "controller.json").unlink(missing_ok=True)
+                    self.port = 0
+                    self.start_server()
+                self.acquire()
+                failed = self.run_client("call", tool, "{}", check=False)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn(text, failed.stderr)
+                self.assertEqual(self.status()["state"], "recovery_required")
+
+    def test_nonfinite_response_requires_recovery(self):
+        self.acquire()
+        failed = self.run_client(
+            "call", "overflow_number", "{}", check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(failed.stdout, "")
+        self.assertIn("non-finite JSON numbers", failed.stderr)
+        self.assertNotIn("Infinity", failed.stdout + failed.stderr)
+        self.assertEqual(self.status()["state"], "recovery_required")
+
+    def test_health_schema_empty_and_missing_tool_rejected(self):
+        for mode, text in (
+            ("bad_tools_schema", "malformed acquire tools/list"),
+            ("no_browser_tabs", "omitted browser_tabs"),
+            ("empty_health", "empty health result"),
+        ):
+            with self.subTest(mode=mode):
+                self.stop_server()
+                (self.state / "controller.json").unlink(missing_ok=True)
+                (self.state / "lease.json").unlink(missing_ok=True)
+                self.port = 0
+                self.start_server(mode)
+                failed = self.run_client("lease", "acquire", "test", check=False)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn(text, failed.stderr)
+                self.assertEqual(self.status()["state"], "recovery_required")
+
+    def test_redirects_and_ambient_proxies(self):
+        self.acquire()
+        self.run_client("list", env={"HTTP_PROXY": "http://127.0.0.1:1",
+                              "HTTPS_PROXY": "http://127.0.0.1:1",
+                              "ALL_PROXY": "http://127.0.0.1:1",
+                              "NO_PROXY": ""})
+        failed = self.run_client("call", "redirect", "{}", check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("redirect", failed.stderr)
+        self.assertEqual(self.status()["state"], "recovery_required")
+
+    def test_wrong_cdp_and_listener_rejected(self):
+        self.acquire()
+        mismatches = (
+            {"BROWSERCTL_CDP_ENDPOINT": "http://127.0.0.1:49334"},
+            {"BROWSERCTL_MCP_URL": "http://127.0.0.1:49334/mcp"},
+        )
+        for updates in mismatches:
+            with self.subTest(updates=updates):
+                starts = len(self.events("start"))
+                deletes = len(self.events("delete"))
+                failed = self.run_client("list", check=False, env=updates)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertEqual(len(self.events("start")), starts)
+                self.assertEqual(len(self.events("delete")), deletes)
+                bad_status = self.run_client(
+                    "lease", "status", check=False, env=updates)
+                self.assertNotEqual(bad_status.returncode, 0)
+                self.assertEqual(self.status()["state"], "ready")
+                self.run_client("list")
+
+        starts = len(self.events("start"))
+        deletes = len(self.events("delete"))
+        wrong_release = self.run_client(
+            "lease", "release", check=False, env=mismatches[0])
+        self.assertNotEqual(wrong_release.returncode, 0)
+        self.assertEqual(len(self.events("start")), starts)
+        self.assertEqual(len(self.events("delete")), deletes)
+        self.assertEqual(self.status()["state"], "ready")
+
+        self.stop_server()
+        (self.state / "lease.json").unlink()
+        self.port = 0
+        self.start_server()
+        self.acquire()
+        sleeper = subprocess.Popen(["sleep", "5"])
+        try:
+            path = self.state / "controller.json"
+            controller = json.loads(path.read_text())
+            controller["pid"] = sleeper.pid
+            fields = Path(f"/proc/{sleeper.pid}/stat").read_text().rsplit(
+                ")", 1)[1].strip().split()
+            controller["start"] = fields[19]
+            path.write_text(json.dumps(controller))
+            path.chmod(0o600)
+            failed = self.run_client("list", check=False)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertIn("exact MCP listener", failed.stderr)
+        finally:
+            sleeper.terminate()
+            sleeper.wait(2)
+
+    def test_delete_failure_and_timeout_quarantine(self):
+        for mode, env, text in (
+            ("delete_500", {}, "DELETE HTTP 500"),
+            ("delete_hang", {"BROWSERCTL_HTTP_TIMEOUT": ".1"},
+             "DELETE failed"),
+        ):
+            with self.subTest(mode=mode):
+                self.stop_server()
+                (self.state / "controller.json").unlink(missing_ok=True)
+                (self.state / "lease.json").unlink(missing_ok=True)
+                self.port = 0
+                self.start_server(mode)
+                self.acquire()
+                failed = self.run_client("lease", "release", check=False, env=env)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn(text, failed.stderr)
+                self.assertEqual(self.status()["state"], "recovery_required")
+
+    def test_recovery_requires_changed_generation_and_retains_health_session(self):
+        self.kill_in_flight()
         unchanged = self.run_client("lease", "recover", check=False)
         self.assertNotEqual(unchanged.returncode, 0)
-        self.assertIn("generation is unchanged", unchanged.stderr)
-        self.restart_server(mode="bad_health")
-        unhealthy = self.run_client("lease", "recover", check=False)
-        self.assertNotEqual(unhealthy.returncode, 0)
-        self.assertIn("malformed controller health tools/list", unhealthy.stderr)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertTrue(status["recovery_required"])
+        self.assertIn("unchanged", unchanged.stderr)
         self.restart_server()
-        recovered = json.loads(self.run_client(
-            "lease", "recover", "5").stdout)
-        self.assertTrue(recovered["recovered"])
-        self.run_client("call", "ok", "{}")
+        before = len([event for event in self.events("post")
+                      if event["method"] == "initialize"])
+        recovered = json.loads(self.run_client("lease", "recover").stdout)
+        self.assertTrue(recovered["session_state_lost"])
+        self.assertIn("do not replay", recovered["next_action"])
+        self.run_client("call", "browser_snapshot", "{}")
+        after = len([event for event in self.events("post")
+                     if event["method"] == "initialize"])
+        self.assertEqual(after, before + 1)
+        calls = [item for item in self.events("post")
+                 if item.get("name") == "browser_snapshot"]
+        self.assertEqual(calls[-1]["session"], recovered["session_id"])
 
-    def test_recovery_requires_working_browser_probe(self):
-        self.quarantine_with_timeout()
-        self.restart_server(mode="bad_browser")
-        failed = self.run_client("lease", "recover", check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn("browser health probe failed", failed.stderr)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "recovery_required")
-
-    def test_recovery_requires_successful_health_session_delete(self):
-        self.quarantine_with_timeout()
-        self.restart_server(mode="bad_delete")
-        failed = self.run_client("lease", "recover", check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn("DELETE HTTP 500", failed.stderr)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "recovery_required")
-
-    def test_recovery_rejects_controller_url_mismatch(self):
-        self.quarantine_with_timeout()
+    def test_recovery_rejects_changed_cdp(self):
+        self.kill_in_flight()
         self.restart_server()
-        controller_path = self.state / "controller.json"
-        controller = json.loads(controller_path.read_text(encoding="utf-8"))
-        controller["mcp_url"] = "http://127.0.0.1:1/mcp"
-        controller_path.write_text(json.dumps(controller), encoding="utf-8")
-        failed = self.run_client("lease", "recover", check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn("different MCP URL", failed.stderr)
-
-    def test_recovery_rejects_listener_on_wrong_loopback_family(self):
-        self.quarantine_with_timeout()
-        self.restart_server()
-        controller_path = self.state / "controller.json"
-        controller = json.loads(controller_path.read_text(encoding="utf-8"))
-        port = urllib.parse.urlsplit(self.env["BROWSERCTL_MCP_URL"]).port
-        ipv6_url = f"http://[::1]:{port}/mcp"
-        controller["mcp_url"] = ipv6_url
-        controller_path.write_text(json.dumps(controller), encoding="utf-8")
+        path = self.state / "controller.json"
+        controller = json.loads(path.read_text())
+        controller["cdp_endpoint"] = "http://127.0.0.1:49334"
+        path.write_text(json.dumps(controller))
+        path.chmod(0o600)
         failed = self.run_client(
             "lease", "recover", check=False,
-            env_updates={"BROWSERCTL_MCP_URL": ipv6_url})
+            env={"BROWSERCTL_CDP_ENDPOINT": "http://127.0.0.1:49334"})
         self.assertNotEqual(failed.returncode, 0)
-        self.assertIn("exact MCP listener address and port", failed.stderr)
+        self.assertIn("caller CDP endpoint", failed.stderr)
 
-    def test_recovery_rejects_missing_dead_or_wrong_generation_state(self):
-        self.quarantine_with_timeout()
-        self.stop_server()
-        missing = self.state / "controller.json"
-        missing.unlink()
-        result = self.run_client("lease", "recover", check=False)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("controller.json is missing", result.stderr)
-        self.start_server()
-        controller = json.loads(missing.read_text(encoding="utf-8"))
-        controller["process_start_time"] = "0"
-        missing.write_text(json.dumps(controller), encoding="utf-8")
-        missing.chmod(0o600)
-        dead = self.run_client("lease", "recover", check=False)
-        self.assertNotEqual(dead.returncode, 0)
-        self.assertIn("missing or was replaced", dead.stderr)
-
-    def test_execution_lock_serializes_racing_calls(self):
+    def test_pending_result_survives_closed_pipe_and_is_not_replayed(self):
         self.acquire()
-        first = subprocess.Popen(
-            [CLIENT, "call", "slow", "{}"],
-            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.wait_for_tool("slow")
-        second = subprocess.Popen(
-            [CLIENT, "call", "ok", "{}"],
-            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        _, first_error = first.communicate(timeout=2)
-        _, second_error = second.communicate(timeout=2)
-        self.assertEqual(first.returncode, 0, first_error)
-        self.assertEqual(second.returncode, 0, second_error)
-        starts = [
-            event for event in self.events()
-            if event["kind"] == "operation_start"
-            and event.get("method") == "tools/call"
-        ]
-        self.assertTrue(starts)
-        self.assertTrue(all(event["active"] == 1 for event in starts))
+        process = subprocess.Popen(
+            [CLIENT, "call", "big", "{}"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        process.stdout.close()
+        process.wait(3)
+        process.stderr.close()
+        self.assertNotEqual(process.returncode, 0)
+        status = self.status()
+        self.assertEqual(status["state"], "result_pending")
+        self.assertEqual(status["result"]["request_id"], 4)
+        self.assertEqual(status["result"]["method"], "tools/call big")
+        self.assertEqual(len([event for event in self.events("start")
+                              if event.get("name") == "big"]), 1)
+        recovered = self.run_client("lease", "result")
+        self.assertIn("x" * 100, recovered.stdout)
+        self.assertEqual(self.status()["state"], "ready")
+        self.assertEqual(len([event for event in self.events("start")
+                              if event.get("name") == "big"]), 1)
 
-    def test_malformed_and_symlinked_state_fail_loudly(self):
+    def test_kill_after_response_before_receipt_ack(self):
+        self.acquire()
+        process = subprocess.Popen(
+            [CLIENT, "call", "big", "{}"], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if self.status()["state"] == "result_pending":
+                break
+            time.sleep(.01)
+        else:
+            self.fail("result receipt was not persisted")
+        process.kill()
+        process.wait(2)
+        process.stdout.close()
+        process.stderr.close()
+        status = self.status()
+        self.assertEqual(status["state"], "result_pending")
+        self.assertEqual(status["result"]["request_id"], 4)
+        self.assertEqual(status["result"]["method"], "tools/call big")
+        self.run_client("lease", "result")
+        self.assertEqual(self.status()["state"], "ready")
+        self.assertEqual(len([event for event in self.events("start")
+                              if event.get("name") == "big"]), 1)
+
+    def test_normal_delivery_clears_receipt_and_errors_are_determinate(self):
+        self.acquire()
+        self.run_client("call", "browser_snapshot", "{}")
+        self.assertEqual(self.status()["state"], "ready")
+        failed = self.run_client("call", "tool_error", "{}", check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(self.status()["state"], "ready")
+        rpc = self.run_client("call", "rpc_error", "{}", check=False)
+        self.assertNotEqual(rpc.returncode, 0)
+        self.assertEqual(self.status()["state"], "ready")
+
+    def test_malformed_symlink_and_modes_fail_loudly(self):
         lease = self.state / "lease.json"
-        lease.write_text('{"owner":"wrong schema"}', encoding="utf-8")
+        lease.write_text("{}")
         lease.chmod(0o600)
-        malformed = self.run_client("lease", "status", check=False)
-        self.assertNotEqual(malformed.returncode, 0)
+        self.assertNotEqual(
+            self.run_client("lease", "status", check=False).returncode, 0)
         lease.unlink()
-        target = self.state / "target.json"
-        target.write_text('{"sentinel":true}', encoding="utf-8")
+        target = Path(self.temp.name) / "target"
+        target.write_text('{"sentinel":true}')
         target.chmod(0o600)
         lease.symlink_to(target)
-        redirected = self.run_client("lease", "status", check=False)
-        self.assertNotEqual(redirected.returncode, 0)
-        self.assertEqual(target.read_text(encoding="utf-8"), '{"sentinel":true}')
+        self.assertNotEqual(
+            self.run_client("lease", "status", check=False).returncode, 0)
+        self.assertEqual(target.read_text(), '{"sentinel":true}')
         lease.unlink()
-        controller = self.state / "controller.json"
-        controller.unlink()
-        controller.symlink_to(target)
-        self.acquire()
-        rejected = self.run_client("list", check=False)
-        self.assertNotEqual(rejected.returncode, 0)
+        self.state.chmod(0o755)
+        self.assertNotEqual(
+            self.run_client("lease", "status", check=False).returncode, 0)
 
-    def test_legacy_idle_migrates_but_in_flight_fails_loudly(self):
-        now = time.time()
-        legacy = {
-            "owner": "legacy",
-            "token_hash": "a" * 64,
-            "acquired_at": now,
-            "expires_at": now + 5,
-        }
-        lease_path = self.state / "lease.json"
-        lease_path.write_text(json.dumps(legacy), encoding="utf-8")
-        lease_path.chmod(0o600)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "held")
-        migrated = json.loads(lease_path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["schema_version"], 1)
-        self.assertNotIn("token_hash", migrated)
-        self.run_client("lease", "release")
-        legacy["in_flight"] = {
-            "id": "b" * 32,
-            "method": "tools/call",
-            "started_at": now,
-        }
-        lease_path.write_text(json.dumps(legacy), encoding="utf-8")
-        lease_path.chmod(0o600)
-        failed = self.run_client("lease", "status", check=False)
-        self.assertNotEqual(failed.returncode, 0)
-        self.assertIn("no controller generation", failed.stderr)
+    def test_new_state_directory_parent_entries_are_synced(self):
+        target = Path(self.temp.name) / "durable" / "nested" / "browserctl"
+        script = (
+            "import json, os\n"
+            "import mcp_client as m\n"
+            "seen=[]\n"
+            "real=m.os.fsync\n"
+            "def observed(fd):\n"
+            " seen.append(os.readlink(f'/proc/self/fd/{fd}'))\n"
+            " real(fd)\n"
+            "m.os.fsync=observed\n"
+            "m.state_dir()\n"
+            "print(json.dumps(seen))\n"
+        )
+        env = self.env.copy()
+        env["BROWSERCTL_STATE_DIR"] = str(target)
+        result = subprocess.run(
+            [sys.executable, "-c", script], cwd=ROOT, env=env,
+            text=True, capture_output=True, check=True)
+        synced = json.loads(result.stdout)
+        base = str(Path(self.temp.name))
+        self.assertEqual(
+            synced[:4],
+            [base, str(target.parent.parent), str(target.parent), str(target)])
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o700)
 
-    def test_tool_is_error_is_nonzero_without_quarantine(self):
+    def test_invalid_environment_fails_before_http(self):
+        for updates in (
+            {"BROWSERCTL_CDP_ENDPOINT": ""},
+            {"BROWSERCTL_CDP_ENDPOINT": "http://localhost:9222"},
+            {"BROWSERCTL_CDP_ENDPOINT": "http://127.0.0.1:9222/"},
+            {"BROWSERCTL_MCP_URL": "https://127.0.0.1:1/mcp"},
+            {"BROWSERCTL_HTTP_TIMEOUT": "nan"},
+            {"BROWSERCTL_TIMEOUT": "0"},
+            {"BROWSERCTL_TIMEOUT": "inf"},
+            {"BROWSERCTL_TIMEOUT": "3601"},
+            {"BROWSERCTL_TIMEOUT": "2", "BROWSERCTL_HTTP_TIMEOUT": "2"},
+        ):
+            with self.subTest(updates=updates):
+                failed = self.run_client(
+                    "lease", "acquire", "test", check=False, env=updates)
+                self.assertNotEqual(failed.returncode, 0)
+
+    def test_invalid_and_oversized_requests_fail_before_dispatch(self):
         self.acquire()
-        result = self.run_client("call", "error", "{}", check=False)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Playwright tool error", result.stderr)
-        status = json.loads(self.run_client("lease", "status").stdout)
-        self.assertEqual(status["state"], "held")
+        for arguments in ('{"value":NaN}', '{"value":Infinity}',
+                          '{"value":1e999}'):
+            with self.subTest(arguments=arguments):
+                starts = len(self.events("start"))
+                failed = self.run_client(
+                    "call", "ok", arguments, check=False)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertEqual(len(self.events("start")), starts)
+                self.assertEqual(self.status()["state"], "ready")
+        script = (
+            "import mcp_client as m\n"
+            "m.MAX_BODY=200\n"
+            "try: m.call('oversized', {'value':'x'*1000})\n"
+            "except m.Error as e: print(e)\n"
+        )
+        starts = len(self.events("start"))
+        oversized = subprocess.run(
+            [sys.executable, "-c", script], cwd=ROOT, env=self.env,
+            text=True, capture_output=True)
+        self.assertEqual(oversized.returncode, 0)
+        self.assertIn("request is too large", oversized.stdout)
+        self.assertEqual(len(self.events("start")), starts)
+        self.assertEqual(self.status()["state"], "ready")
+
+    def test_unretainable_completed_results_are_determinate(self):
+        self.acquire()
+        for tool in ("large_receipt", "surrogate"):
+            with self.subTest(tool=tool):
+                starts = len(self.events("start"))
+                failed = self.run_client("call", tool, "{}", check=False)
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertIn("operation completed", failed.stderr)
+                self.assertIn("do not replay", failed.stderr)
+                self.assertEqual(len(self.events("start")), starts + 1)
+                self.assertEqual(self.status()["state"], "ready")
+
+    def test_launcher_requires_cdp_pins_package_and_disables_heartbeat(self):
+        self.stop_server()
+        fake_bin = Path(self.temp.name) / "bin"
+        fake_bin.mkdir()
+        npx = fake_bin / "npx"
+        npx.write_text("#!/bin/sh\nprintf '%s\\n' \"$PLAYWRIGHT_MCP_PING_TIMEOUT_MS\" \"$@\"\n")
+        npx.chmod(0o700)
+        (self.state / "controller.json").unlink(missing_ok=True)
+        missing = subprocess.run(
+            [ROOT / "start-controller.sh"],
+            env={**self.env, "PATH": f"{fake_bin}:{self.env['PATH']}",
+                 "BROWSERCTL_CDP_ENDPOINT": ""},
+            text=True, capture_output=True)
+        self.assertNotEqual(missing.returncode, 0)
+        result = subprocess.run(
+            [ROOT / "start-controller.sh"],
+            env={**self.env, "PATH": f"{fake_bin}:{self.env['PATH']}",
+                 "BROWSERCTL_HOST": "127.0.0.1", "BROWSERCTL_PORT": "47883",
+                 "BROWSERCTL_MCP_URL": "http://127.0.0.1:47883/mcp"},
+            text=True, capture_output=True, check=True)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[0], "0")
+        self.assertIn("@playwright/mcp@0.0.78", lines)
+        self.assertEqual(lines[lines.index("--allowed-hosts") + 1],
+                         "127.0.0.1:47883")
+        controller = json.loads(
+            (self.state / "controller.json").read_text())
+        self.assertEqual(controller["cdp_endpoint"], CDP)
+        self.assertIn("boot_id", controller)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) >= 2 and sys.argv[1] == "--fake-server":
-        run_fake_server(*sys.argv[2:])
+    if sys.argv[1:2] == ["--fake-server"]:
+        fake_server(*sys.argv[2:])
     else:
-        unittest.main()
+        unittest.main(verbosity=2)

@@ -2,37 +2,32 @@
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-: "${BROWSERCTL_CDP_ENDPOINT:=http://127.0.0.1:9222}"
+: "${BROWSERCTL_CDP_ENDPOINT:?BROWSERCTL_CDP_ENDPOINT is required}"
 : "${BROWSERCTL_HOST:=127.0.0.1}"
 : "${BROWSERCTL_PORT:=47883}"
 : "${BROWSERCTL_NPM_CACHE:=${XDG_CACHE_HOME:-$HOME/.cache}/browserctl/npm}"
 
-if [[ "$BROWSERCTL_HOST" != 127.0.0.1 && "$BROWSERCTL_HOST" != localhost && "$BROWSERCTL_HOST" != ::1 ]]; then
-  echo "start-controller: refusing non-loopback BROWSERCTL_HOST=$BROWSERCTL_HOST" >&2
+if [[ "$BROWSERCTL_HOST" != 127.0.0.1 && "$BROWSERCTL_HOST" != ::1 ]]; then
+  echo "start-controller: BROWSERCTL_HOST must be numeric loopback" >&2
   exit 2
 fi
-if [[ "$BROWSERCTL_HOST" == localhost ]]; then
-  BROWSERCTL_HOST=127.0.0.1
+if [[ ! "$BROWSERCTL_PORT" =~ ^[0-9]+$ ]] || (( BROWSERCTL_PORT < 1 || BROWSERCTL_PORT > 65535 )); then
+  echo "start-controller: BROWSERCTL_PORT must be 1-65535" >&2
+  exit 2
 fi
 
-if [[ "$BROWSERCTL_HOST" == "::1" ]]; then
-  BROWSERCTL_ALLOWED_HOST="[::1]:${BROWSERCTL_PORT}"
+if [[ "$BROWSERCTL_HOST" == ::1 ]]; then
+  AUTHORITY="[::1]:${BROWSERCTL_PORT}"
 else
-  BROWSERCTL_ALLOWED_HOST="${BROWSERCTL_HOST}:${BROWSERCTL_PORT}"
+  AUTHORITY="${BROWSERCTL_HOST}:${BROWSERCTL_PORT}"
 fi
-
-if [[ -z "${BROWSERCTL_MCP_URL:-}" ]]; then
-  if [[ "$BROWSERCTL_HOST" == "::1" ]]; then
-    BROWSERCTL_MCP_URL="http://[::1]:${BROWSERCTL_PORT}/mcp"
-  else
-    BROWSERCTL_MCP_URL="http://${BROWSERCTL_HOST}:${BROWSERCTL_PORT}/mcp"
-  fi
-fi
+: "${BROWSERCTL_MCP_URL:=http://${AUTHORITY}/mcp}"
 export BROWSERCTL_MCP_URL
 
 BROWSERCTL_CONTROLLER_HOST="$BROWSERCTL_HOST" \
 BROWSERCTL_CONTROLLER_PORT="$BROWSERCTL_PORT" \
-  python3 "$ROOT/mcp_client.py" controller register "$$" "$BROWSERCTL_MCP_URL"
+  python3 "$ROOT/mcp_client.py" controller register \
+  "$$" "$BROWSERCTL_MCP_URL" "$BROWSERCTL_CDP_ENDPOINT"
 
 exec env PLAYWRIGHT_MCP_PING_TIMEOUT_MS=0 \
   npm_config_cache="$BROWSERCTL_NPM_CACHE" \
@@ -40,5 +35,5 @@ exec env PLAYWRIGHT_MCP_PING_TIMEOUT_MS=0 \
   --cdp-endpoint "$BROWSERCTL_CDP_ENDPOINT" \
   --shared-browser-context \
   --host "$BROWSERCTL_HOST" \
-  --allowed-hosts "$BROWSERCTL_ALLOWED_HOST" \
+  --allowed-hosts "$AUTHORITY" \
   --port "$BROWSERCTL_PORT"

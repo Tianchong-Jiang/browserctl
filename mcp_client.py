@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Minimal tokenless leased Streamable HTTP MCP client with strict failures."""
+"""One fail-closed leased Streamable HTTP MCP session."""
 
 import base64
 import binascii
@@ -18,874 +18,1074 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-URL = os.environ.get("BROWSERCTL_MCP_URL", "http://127.0.0.1:47883/mcp")
-TIMEOUT = float(os.environ.get("BROWSERCTL_HTTP_TIMEOUT", "30"))
-HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-LOCK_TIMEOUT = None
+VERSION = 2
+PROTOCOL = "2025-03-26"
 MAX_WAIT = 3600.0
-MAX_TTL = 86400.0
-MAX_SEQUENCE_CALLS = 10
+MAX_BODY = 16 * 1024 * 1024
+PHASES = {"initializing", "ready", "in_progress", "result_pending",
+          "closing", "recovery_required"}
+LEASE_KEYS = {"schema_version", "phase", "owner", "acquired_at", "mcp_url",
+              "cdp_endpoint", "controller_generation", "session_id",
+              "protocol_version", "next_request_id", "client", "operation",
+              "receipt", "reason"}
+SYNCED_STATE_DIRS = set()
 
 
-def die(message):
-    print(f"browserctl: {message}", file=sys.stderr)
-    raise SystemExit(1)
+class Error(Exception):
+    pass
 
 
-def parse_duration(value, name, minimum, maximum):
+def fail(message):
+    raise Error(message)
+
+
+def reject_constant(value):
+    fail(f"non-finite JSON number {value} is forbidden")
+
+
+def validate_json(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        fail("non-finite JSON numbers are forbidden")
+    if isinstance(value, list):
+        for item in value:
+            validate_json(item)
+    elif isinstance(value, dict):
+        for item in value.values():
+            validate_json(item)
+
+
+def duration(value, name, low, high):
     try:
-        result = float(value)
-    except ValueError:
-        die(f"{name} must be a number")
-    if not math.isfinite(result) or not minimum <= result <= maximum:
-        die(f"{name} must be between {minimum:g} and {maximum:g} seconds")
-    return result
+        number = float(value)
+    except (TypeError, ValueError):
+        fail(f"{name} must be a number")
+    if not math.isfinite(number) or not low <= number <= high:
+        fail(f"{name} must be between {low:g} and {high:g} seconds")
+    return number
 
 
-LOCK_TIMEOUT = parse_duration(
-    os.environ.get("BROWSERCTL_LOCK_TIMEOUT", "45"),
-    "lock timeout", 0.1, MAX_WAIT)
+def timeout():
+    return duration(os.getenv("BROWSERCTL_HTTP_TIMEOUT", "90"),
+                    "HTTP timeout", .1, 300)
 
 
-def state_directory():
-    configured = os.environ.get("BROWSERCTL_STATE_DIR")
-    if configured:
-        path = Path(configured)
-    elif os.environ.get("XDG_RUNTIME_DIR"):
-        path = Path(os.environ["XDG_RUNTIME_DIR"]) / "browserctl"
-    else:
-        path = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-        path /= "browserctl"
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path_stat = path.lstat()
-    if path.is_symlink() or not path.is_dir() or path_stat.st_uid != os.getuid():
-        die(f"unsafe state directory: {path}")
-    os.chmod(path, 0o700)
+def state_dir():
+    value = os.getenv("BROWSERCTL_STATE_DIR")
+    path = Path(value) if value else Path(
+        os.getenv("XDG_STATE_HOME", Path.home() / ".local/state")) / "browserctl"
+    path = path.absolute()
+    try:
+        missing = []
+        current = path
+        while not current.exists():
+            missing.append(current)
+            if current == current.parent:
+                fail(f"cannot find an existing parent for state directory {path}")
+            current = current.parent
+        for directory in reversed(missing):
+            directory.mkdir(mode=0o700)
+            sync_dir(directory.parent)
+        info = path.lstat()
+    except OSError as exc:
+        fail(f"cannot prepare state directory {path}: {exc}")
+    if (path.is_symlink() or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700):
+        fail(f"state directory must be owner-controlled mode 0700: {path}")
+    identity = str(path)
+    if identity not in SYNCED_STATE_DIRS:
+        for directory in (path, *path.parents):
+            sync_dir(directory)
+        SYNCED_STATE_DIRS.add(identity)
     return path
 
 
-@contextlib.contextmanager
-def locked_file(name):
-    path = state_directory() / name
-    flags = os.O_RDWR | os.O_CREAT
+def open_private(path, flags):
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
         fd = os.open(path, flags, 0o600)
     except OSError as exc:
-        die(f"cannot open lock {path}: {exc}")
+        fail(f"cannot open private state file {path}: {exc}")
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600):
+        os.close(fd)
+        fail(f"state file must be owner-controlled mode 0600: {path}")
+    return fd
+
+
+@contextlib.contextmanager
+def lock(name, wait=None):
+    fd = open_private(state_dir() / name, os.O_RDWR | os.O_CREAT)
     try:
-        os.fchmod(fd, 0o600)
-        deadline = time.monotonic() + LOCK_TIMEOUT
+        budget = duration(
+            os.getenv("BROWSERCTL_LOCK_TIMEOUT", "45"),
+            "lock timeout", .1, MAX_WAIT)
+        if wait is not None:
+            budget = min(budget, max(0, wait))
+        deadline = time.monotonic() + budget
         while True:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    die(f"timed out waiting for {name}")
-                time.sleep(0.05)
+                    fail(f"timed out waiting for {name}")
+                time.sleep(.05)
         yield
     finally:
         os.close(fd)
 
 
-def state_path(name):
-    return state_directory() / name
-
-
-def fsync_directory(directory):
-    directory_fd = os.open(directory, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
-
-
-def read_private_json(name, missing_ok=False):
-    path = state_path(name)
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+def read_json(name, missing=False):
+    path = state_dir() / name
+    flags = os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0)
     try:
         fd = os.open(path, flags)
-        file_stat = os.fstat(fd)
-        if (not stat.S_ISREG(file_stat.st_mode)
-                or file_stat.st_uid != os.getuid()
-                or file_stat.st_mode & 0o077):
-            os.close(fd)
-            die(f"{name} is not a private owner-controlled regular file")
+    except FileNotFoundError:
+        if missing:
+            return None
+        fail(f"{name} is missing")
+    except OSError as exc:
+        fail(f"cannot open {name}: {exc}")
+    info = os.fstat(fd)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600):
+        os.close(fd)
+        fail(f"{name} must be owner-controlled mode 0600")
+    try:
         with os.fdopen(fd, encoding="utf-8") as stream:
             return json.load(stream)
-    except FileNotFoundError:
-        if missing_ok:
-            return None
-        die(f"{name} is missing")
     except (OSError, json.JSONDecodeError) as exc:
-        die(f"cannot read {name}: {exc}")
+        fail(f"cannot read {name}: {exc}")
 
 
-def write_private_json(name, value):
-    directory = state_directory()
-    fd, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=directory)
+def sync_dir(path):
     try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        fail(f"cannot sync state directory: {exc}")
+
+
+def write_json(name, value):
+    directory = state_dir()
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=directory)
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, separators=(",", ":"))
+            json.dump(value, stream, separators=(",", ":"), ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, state_path(name))
-        fsync_directory(directory)
+        os.replace(temporary, directory / name)
+        sync_dir(directory)
+    except OSError as exc:
+        fail(f"cannot durably write {name}: {exc}")
     finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-
-
-def remove_state(name):
-    try:
-        state_path(name).unlink()
-        fsync_directory(state_directory())
-    except FileNotFoundError:
-        pass
-
-
-def numeric(value):
-    return type(value) in (int, float) and math.isfinite(value)
-
-
-def valid_operation(operation, require_generation):
-    required = {"id", "method", "started_at"}
-    if require_generation:
-        required.add("controller_generation")
-    valid = (
-        isinstance(operation, dict)
-        and set(operation) == required
-        and isinstance(operation.get("id"), str)
-        and len(operation["id"]) == 32
-        and all(char in "0123456789abcdef" for char in operation["id"])
-        and operation.get("method") in {"tools/list", "tools/call"}
-        and numeric(operation.get("started_at"))
-    )
-    if require_generation:
-        valid = (
-            valid
-            and isinstance(operation.get("controller_generation"), str)
-            and len(operation["controller_generation"]) == 32
-            and all(char in "0123456789abcdef"
-                    for char in operation["controller_generation"])
-        )
-    return valid
-
-
-def valid_common_lease(lease, allowed, required):
-    return (
-        isinstance(lease, dict)
-        and set(lease) <= allowed
-        and required <= lease.keys()
-        and isinstance(lease.get("owner"), str)
-        and 0 < len(lease["owner"]) <= 200
-        and numeric(lease.get("acquired_at"))
-        and numeric(lease.get("expires_at"))
-        and lease["expires_at"] >= lease["acquired_at"]
-    )
-
-
-def read_lease():
-    lease = read_private_json("lease.json", missing_ok=True)
-    if lease is None:
-        return None
-
-    required = {"schema_version", "owner", "acquired_at", "expires_at"}
-    allowed = required | {"in_flight"}
-    valid = (
-        valid_common_lease(lease, allowed, required)
-        and lease["schema_version"] == 1
-        and ("in_flight" not in lease
-             or valid_operation(lease["in_flight"], require_generation=True))
-    )
-    if valid:
-        return lease
-
-    legacy_required = {"owner", "token_hash", "acquired_at", "expires_at"}
-    legacy_allowed = legacy_required | {"in_flight"}
-    legacy = (
-        valid_common_lease(lease, legacy_allowed, legacy_required)
-        and isinstance(lease["token_hash"], str)
-        and len(lease["token_hash"]) == 64
-        and all(char in "0123456789abcdef" for char in lease["token_hash"])
-        and ("in_flight" not in lease
-             or valid_operation(lease["in_flight"], require_generation=False))
-    )
-    if not legacy:
-        die("lease state is malformed")
-    if "in_flight" in lease:
-        die("legacy lease has an indeterminate operation but no controller "
-            "generation; restart the controller and perform manual operator "
-            "recovery before using this state")
-
-    migrated = {
-        "schema_version": 1,
-        "owner": lease["owner"],
-        "acquired_at": lease["acquired_at"],
-        "expires_at": lease["expires_at"],
-    }
-    write_lease(migrated)
-    return migrated
-
-
-def write_lease(lease):
-    write_private_json("lease.json", lease)
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
 
 def remove_lease():
-    remove_state("lease.json")
-
-
-def active_lease(now=None):
-    lease = read_lease()
-    if (lease and "in_flight" not in lease
-            and lease["expires_at"] <= (time.time() if now is None else now)):
-        remove_lease()
-        return None
-    return lease
-
-
-def require_lease(allow_in_flight=False, allow_expired=False):
-    lease = active_lease()
-    if lease is None:
-        die("no active singleton lease")
-    if "in_flight" in lease and not allow_in_flight:
-        die("lease has an indeterminate in-flight MCP operation; restart the "
-            "controller, then run lease recover")
-    if lease["expires_at"] <= time.time() and not allow_expired:
-        die("lease is expired")
-    return lease
-
-
-def acquire(owner, wait, ttl):
-    if not owner or len(owner) > 200 or any(ord(char) < 32 for char in owner):
-        die("lease owner must be 1-200 printable characters")
-    deadline = time.monotonic() + wait
-    while True:
-        with locked_file("state.lock"):
-            now = time.time()
-            lease = active_lease(now)
-            if lease is None:
-                lease = {
-                    "schema_version": 1,
-                    "owner": owner,
-                    "acquired_at": now,
-                    "expires_at": now + ttl,
-                }
-                write_lease(lease)
-                print(json.dumps({
-                    "acquired": True,
-                    "owner": owner,
-                    "acquired_at": now,
-                    "expires_at": now + ttl,
-                }, sort_keys=True))
-                return
-            held_by = lease["owner"]
-            in_flight = "in_flight" in lease
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            if in_flight:
-                die(f"lease held by {held_by!r} requires recovery for an "
-                    "in-flight MCP operation")
-            die(f"lease is held by {held_by!r}")
-        time.sleep(min(0.05, remaining))
-
-
-def process_identity(pid):
     try:
-        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        fields = text.rsplit(")", 1)[1].strip().split()
-        return fields[19]
+        (state_dir() / "lease.json").unlink()
+        sync_dir(state_dir())
+    except OSError as exc:
+        fail(f"cannot durably remove lease: {exc}")
+
+
+def boot_id():
+    try:
+        value = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError as exc:
+        fail(f"cannot read Linux boot identity: {exc}")
+    if len(value) != 36:
+        fail("Linux boot identity is malformed")
+    return value
+
+
+def process(pid):
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(
+            ")", 1)[1].strip().split()
+        return None if fields[0] == "Z" else fields[19]
     except (FileNotFoundError, IndexError, OSError):
         return None
 
 
-def parse_controller(value):
-    required = {
-        "schema_version", "generation", "pid", "process_start_time",
-        "mcp_url", "registered_at",
-    }
-    valid = (
-        isinstance(value, dict)
-        and set(value) == required
-        and value.get("schema_version") == 1
-        and isinstance(value.get("generation"), str)
-        and len(value["generation"]) == 32
-        and all(char in "0123456789abcdef" for char in value["generation"])
-        and type(value.get("pid")) is int
-        and value["pid"] > 1
-        and isinstance(value.get("process_start_time"), str)
-        and value["process_start_time"].isdigit()
-        and isinstance(value.get("mcp_url"), str)
-        and numeric(value.get("registered_at"))
-    )
-    if not valid:
-        die("controller generation state is malformed")
+def client():
+    start = process(os.getpid())
+    if start is None:
+        fail("cannot identify client process")
+    return {"pid": os.getpid(), "start": start, "boot_id": boot_id()}
+
+
+def valid_client(value):
+    return (isinstance(value, dict) and set(value) == {"pid", "start", "boot_id"}
+            and type(value["pid"]) is int and value["pid"] > 1
+            and isinstance(value["start"], str) and value["start"].isdigit()
+            and isinstance(value["boot_id"], str) and len(value["boot_id"]) == 36)
+
+
+def alive(value):
+    return (valid_client(value) and value["boot_id"] == boot_id()
+            and process(value["pid"]) == value["start"])
+
+
+def valid_operation(value):
+    return (isinstance(value, dict)
+            and set(value) == {"kind", "method", "request_id", "started_at"}
+            and value["kind"] in {"request", "notification", "delete"}
+            and isinstance(value["method"], str) and bool(value["method"])
+            and (value["request_id"] is None
+                 or type(value["request_id"]) is int and value["request_id"] > 0)
+            and isinstance(value["started_at"], (int, float))
+            and math.isfinite(value["started_at"]))
+
+
+def valid_receipt(value):
+    try:
+        stdout_size = len(value.get("stdout", "").encode())
+        stderr_size = len(value.get("stderr", "").encode())
+    except (AttributeError, UnicodeEncodeError):
+        return False
+    return (isinstance(value, dict)
+            and set(value) == {"id", "request_id", "method", "stdout",
+                              "stderr", "exit_code", "completed_at"}
+            and isinstance(value["id"], str) and len(value["id"]) == 32
+            and type(value["request_id"]) is int and value["request_id"] > 0
+            and isinstance(value["method"], str) and bool(value["method"])
+            and isinstance(value["stdout"], str)
+            and isinstance(value["stderr"], str)
+            and value["exit_code"] in {0, 1}
+            and isinstance(value["completed_at"], (int, float))
+            and math.isfinite(value["completed_at"])
+            and stdout_size <= MAX_BODY and stderr_size <= MAX_BODY)
+
+
+def parse_lease(value):
+    scalar = (isinstance(value, dict) and set(value) == LEASE_KEYS
+              and value.get("schema_version") == VERSION
+              and value.get("phase") in PHASES
+              and isinstance(value.get("owner"), str)
+              and 0 < len(value["owner"]) <= 200
+              and isinstance(value.get("acquired_at"), (int, float))
+              and math.isfinite(value["acquired_at"])
+              and isinstance(value.get("mcp_url"), str)
+              and isinstance(value.get("cdp_endpoint"), str)
+              and isinstance(value.get("controller_generation"), str)
+              and len(value["controller_generation"]) == 32
+              and all(char in "0123456789abcdef"
+                      for char in value["controller_generation"])
+              and (value.get("session_id") is None
+                   or isinstance(value["session_id"], str)
+                   and 0 < len(value["session_id"]) <= 256
+                   and all(32 <= ord(char) < 127 for char in value["session_id"]))
+              and (value.get("protocol_version") is None
+                   or value["protocol_version"] == PROTOCOL)
+              and type(value.get("next_request_id")) is int
+              and value["next_request_id"] > 0
+              and (value.get("client") is None or valid_client(value["client"]))
+              and (value.get("operation") is None
+                   or valid_operation(value["operation"]))
+              and (value.get("receipt") is None
+                   or valid_receipt(value["receipt"]))
+              and (value.get("reason") is None
+                   or isinstance(value["reason"], str)
+                   and 0 < len(value["reason"]) <= 1000))
+    if not scalar:
+        fail("lease state is malformed or unsupported")
+    phase = value["phase"]
+    if phase == "ready":
+        shape = (value["session_id"] and value["protocol_version"]
+                 and value["client"] is None and value["operation"] is None
+                 and value["receipt"] is None and value["reason"] is None)
+    elif phase == "result_pending":
+        shape = (value["session_id"] and value["protocol_version"]
+                 and value["client"] is None and value["operation"] is None
+                 and valid_receipt(value["receipt"]) and value["reason"] is None)
+    elif phase in {"initializing", "in_progress", "closing"}:
+        shape = (valid_client(value["client"])
+                 and valid_operation(value["operation"])
+                 and value["receipt"] is None and value["reason"] is None)
+    else:
+        shape = (value["client"] is None and value["operation"] is None
+                 and value["receipt"] is None and bool(value["reason"]))
+    if not shape:
+        fail("lease phase fields are inconsistent")
     return value
 
 
-def read_controller(missing_ok=False):
-    value = read_private_json("controller.json", missing_ok=missing_ok)
-    return None if value is None else parse_controller(value)
+def read_lease(missing=False):
+    value = read_json("lease.json", missing)
+    return None if value is None else parse_lease(value)
 
 
-def controller_process_alive(controller):
-    return process_identity(controller["pid"]) == controller["process_start_time"]
+def write_lease(value):
+    parse_lease(value)
+    write_json("lease.json", value)
 
 
-def endpoint():
-    parsed = urllib.parse.urlsplit(URL)
-    if (parsed.scheme != "http" or parsed.path != "/mcp"
-            or parsed.query or parsed.fragment
-            or parsed.hostname not in {"127.0.0.1", "::1"}
-            or parsed.port is None):
-        die("BROWSERCTL_MCP_URL must use explicit 127.0.0.1 or ::1 with "
-            "http://.../mcp and an explicit port")
-    return parsed
-
-
-def listening_inodes(address, port):
-    found = set()
-    if address == "127.0.0.1":
-        table, encoded_address = "/proc/net/tcp", "0100007F"
-    else:
-        table = "/proc/net/tcp6"
-        encoded_address = "00000000000000000000000001000000"
+def endpoint(value, name, mcp=False):
+    if not value:
+        fail(f"{name} is required")
     try:
-        lines = Path(table).read_text(encoding="ascii").splitlines()[1:]
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as exc:
+        fail(f"{name} is invalid: {exc}")
+    paths = {"/mcp"} if mcp else {""}
+    if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"}
+            or port is None or not 1 <= port <= 65535
+            or parsed.username or parsed.password
+            or parsed.path not in paths or parsed.query or parsed.fragment):
+        fail(f"{name} must be a canonical numeric loopback HTTP URL with port")
+    host = f"[{parsed.hostname}]" if parsed.hostname == "::1" else parsed.hostname
+    canonical = f"http://{host}:{port}{'/mcp' if mcp else ''}"
+    if value != canonical:
+        fail(f"{name} is not canonically spelled")
+    return parsed, canonical
+
+
+def mcp_url():
+    return endpoint(os.getenv(
+        "BROWSERCTL_MCP_URL", "http://127.0.0.1:47883/mcp"),
+        "BROWSERCTL_MCP_URL", True)[1]
+
+
+def cdp_endpoint():
+    return endpoint(os.getenv("BROWSERCTL_CDP_ENDPOINT"),
+                    "BROWSERCTL_CDP_ENDPOINT")[1]
+
+
+def parse_controller(value):
+    keys = {"schema_version", "generation", "pid", "start", "boot_id",
+            "mcp_url", "cdp_endpoint", "registered_at"}
+    if not (isinstance(value, dict) and set(value) == keys
+            and value.get("schema_version") == VERSION
+            and isinstance(value.get("generation"), str)
+            and len(value["generation"]) == 32
+            and all(char in "0123456789abcdef" for char in value["generation"])
+            and type(value.get("pid")) is int and value["pid"] > 1
+            and isinstance(value.get("start"), str) and value["start"].isdigit()
+            and isinstance(value.get("boot_id"), str)
+            and len(value["boot_id"]) == 36
+            and isinstance(value.get("registered_at"), (int, float))
+            and math.isfinite(value["registered_at"])):
+        fail("controller state is malformed or unsupported")
+    endpoint(value["mcp_url"], "recorded MCP URL", True)
+    endpoint(value["cdp_endpoint"], "recorded CDP endpoint")
+    return value
+
+
+def read_controller(missing=False):
+    value = read_json("controller.json", missing)
+    if value is None:
+        return None
+    return parse_controller(value)
+
+
+def controller_alive(value):
+    return value["boot_id"] == boot_id() and process(value["pid"]) == value["start"]
+
+
+def listener_inodes(address, port):
+    table, encoded = (("/proc/net/tcp", "0100007F")
+                      if address == "127.0.0.1" else
+                      ("/proc/net/tcp6", "00000000000000000000000001000000"))
+    try:
+        lines = Path(table).read_text().splitlines()[1:]
     except OSError as exc:
-        die(f"cannot inspect controller listeners: {exc}")
-    for line in lines:
-        fields = line.split()
-        if len(fields) > 9:
-            local_address, local_port = fields[1].rsplit(":", 1)
-            if (local_address == encoded_address
-                    and int(local_port, 16) == port
-                    and fields[3] == "0A"):
-                found.add(fields[9])
-    return found
+        fail(f"cannot inspect MCP listener: {exc}")
+    return {fields[9] for line in lines if len(fields := line.split()) > 9
+            and fields[1].rsplit(":", 1)[0] == encoded
+            and int(fields[1].rsplit(":", 1)[1], 16) == port
+            and fields[3] == "0A"}
 
 
-def process_tree(root_pid):
+def owns_listener(root, address, port):
+    inodes = listener_inodes(address, port)
     parents = {}
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
         try:
-            text = (entry / "stat").read_text(encoding="utf-8")
-            fields = text.rsplit(")", 1)[1].strip().split()
+            fields = (entry / "stat").read_text().rsplit(
+                ")", 1)[1].strip().split()
             parents[int(entry.name)] = int(fields[1])
         except (FileNotFoundError, IndexError, OSError, ValueError):
-            continue
-    descendants = {root_pid}
-    changed = True
-    while changed:
-        changed = False
-        for pid, parent in parents.items():
-            if parent in descendants and pid not in descendants:
-                descendants.add(pid)
-                changed = True
-    return descendants
-
-
-def process_tree_owns_listener(root_pid, address, port):
-    inodes = listening_inodes(address, port)
-    if not inodes:
-        return False
-    for pid in process_tree(root_pid):
+            pass
+    tree = {root}
+    while True:
+        new = {pid for pid, parent in parents.items() if parent in tree} - tree
+        if not new:
+            break
+        tree |= new
+    for pid in tree:
         try:
             descriptors = Path(f"/proc/{pid}/fd").iterdir()
             for descriptor in descriptors:
                 try:
                     target = os.readlink(descriptor)
-                except (FileNotFoundError, PermissionError, OSError):
+                except OSError:
                     continue
-                if (target.startswith("socket:[") and target.endswith("]")
-                        and target[8:-1] in inodes):
+                if target.startswith("socket:[") and target[8:-1] in inodes:
                     return True
-        except (FileNotFoundError, PermissionError, OSError):
-            continue
+        except OSError:
+            pass
     return False
 
 
-def validated_controller():
-    controller = read_controller()
-    parsed = endpoint()
-    if controller["mcp_url"] != URL:
-        die("controller generation belongs to a different MCP URL")
-    if not controller_process_alive(controller):
-        die("recorded controller process is missing or was replaced")
-    if not process_tree_owns_listener(
-            controller["pid"], parsed.hostname, parsed.port):
-        die("recorded controller process tree does not own the exact MCP "
-            "listener address and port")
-    return controller
+def validate_config(cdp, mcp):
+    if mcp_url() != mcp:
+        fail("caller MCP URL does not match the lease")
+    if cdp_endpoint() != cdp:
+        fail("caller CDP endpoint does not match the lease")
 
 
-def register_controller(arguments):
-    if len(arguments) != 2:
-        die("internal controller registration usage error")
+def validate_controller(generation=None, cdp=None, mcp=None):
+    value = read_controller()
+    expected_mcp = mcp if mcp is not None else mcp_url()
+    expected_cdp = cdp if cdp is not None else cdp_endpoint()
+    if value["mcp_url"] != expected_mcp:
+        fail("registered controller has a different MCP URL")
+    if value["cdp_endpoint"] != expected_cdp:
+        fail("registered controller has a different CDP endpoint")
+    if generation and value["generation"] != generation:
+        fail("registered controller generation changed")
+    parsed = urllib.parse.urlsplit(value["mcp_url"])
+    if not controller_alive(value):
+        fail("registered controller is dead, replaced, reboot-stale, or a zombie")
+    if not owns_listener(value["pid"], parsed.hostname, parsed.port):
+        fail("registered controller does not own the exact MCP listener")
+    return value
+
+
+def register(arguments):
+    if len(arguments) != 3:
+        fail("internal registration usage error")
     try:
         pid = int(arguments[0])
     except ValueError:
-        die("controller PID is invalid")
-    if pid != os.getppid():
-        die("controller registration PID must be the registering process parent")
-    parsed = endpoint()
-    if arguments[1] != URL or parsed.geturl() != URL:
-        die("controller registration URL mismatch")
-    configured_host = os.environ.get("BROWSERCTL_CONTROLLER_HOST")
-    if parsed.hostname != configured_host:
-        die("controller registration URL and bind host differ")
+        fail("controller PID is invalid")
+    mcp, cdp = mcp_url(), cdp_endpoint()
+    parsed = urllib.parse.urlsplit(mcp)
+    if (pid != os.getppid() or arguments[1:] != [mcp, cdp]
+            or os.getenv("BROWSERCTL_CONTROLLER_HOST") != parsed.hostname):
+        fail("controller registration identity mismatch")
     try:
         configured_port = int(os.environ["BROWSERCTL_CONTROLLER_PORT"])
     except (KeyError, ValueError):
-        die("controller registration port is invalid")
-    if parsed.port != configured_port:
-        die("controller registration URL and listening port differ")
-    start_time = process_identity(pid)
-    if start_time is None:
-        die("controller launcher process is missing")
-    with locked_file("execution.lock"):
-        with locked_file("state.lock"):
-            previous = read_controller(missing_ok=True)
-            if previous is not None and controller_process_alive(previous):
-                die("the previously registered controller process is still alive")
-            write_private_json("controller.json", {
-                "schema_version": 1,
-                "generation": secrets.token_hex(16),
-                "pid": pid,
-                "process_start_time": start_time,
-                "mcp_url": arguments[1],
-                "registered_at": time.time(),
-            })
+        fail("controller registration port is invalid")
+    start = process(pid)
+    if configured_port != parsed.port or start is None:
+        fail("controller registration process or port is invalid")
+    with lock("execution.lock"), lock("state.lock"):
+        previous = read_controller(True)
+        if previous and controller_alive(previous):
+            fail("previously registered controller is still alive")
+        write_json("controller.json", {
+            "schema_version": VERSION, "generation": secrets.token_hex(16),
+            "pid": pid, "start": start, "boot_id": boot_id(),
+            "mcp_url": mcp, "cdp_endpoint": cdp, "registered_at": time.time()})
 
 
-def lease_status():
-    now = time.time()
-    lease = read_lease()
-    reclaimed = False
-    if lease and "in_flight" not in lease and lease["expires_at"] <= now:
-        remove_lease()
-        lease = None
-        reclaimed = True
-    if lease is None:
-        return {
-            "state": "available",
-            "available": True,
-            "expired": False,
-            "in_flight": False,
-            "recovery_required": False,
-            "reclaimed_expired_lease": reclaimed,
-        }
-    expired = lease["expires_at"] <= now
-    in_flight = "in_flight" in lease
-    status = {
-        "state": "recovery_required" if in_flight else "held",
-        "available": False,
-        "owner": lease["owner"],
-        "acquired_at": lease["acquired_at"],
-        "expires_at": lease["expires_at"],
-        "expired": expired,
-        "in_flight": in_flight,
-        "recovery_required": in_flight,
-    }
-    if in_flight:
-        status["in_flight_operation"] = lease["in_flight"]
-    else:
-        status["expires_in"] = max(0, lease["expires_at"] - now)
-    return status
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
-def lease_command(arguments):
-    if not arguments:
-        die("usage: client.sh lease acquire|renew|status|release|recover ...")
-    action = arguments[0]
-    if action == "acquire" and 2 <= len(arguments) <= 4:
-        wait = parse_duration(arguments[2] if len(arguments) > 2 else "0",
-                              "wait", 0, MAX_WAIT)
-        ttl = parse_duration(arguments[3] if len(arguments) > 3 else "300",
-                             "TTL", 0.1, MAX_TTL)
-        acquire(arguments[1], wait, ttl)
-    elif action == "renew" and len(arguments) <= 2:
-        ttl = parse_duration(arguments[1] if len(arguments) == 2 else "300",
-                             "TTL", 0.1, MAX_TTL)
-        with locked_file("state.lock"):
-            lease = require_lease()
-            lease["expires_at"] = time.time() + ttl
-            write_lease(lease)
-        print(json.dumps({
-            "renewed": True,
-            "owner": lease["owner"],
-            "expires_at": lease["expires_at"],
-        }, sort_keys=True))
-    elif action == "status" and len(arguments) == 1:
-        with locked_file("state.lock"):
-            status = lease_status()
-        print(json.dumps(status, sort_keys=True))
-    elif action == "release" and len(arguments) == 1:
-        with locked_file("execution.lock"):
-            with locked_file("state.lock"):
-                lease = require_lease()
-                remove_lease()
-        print(json.dumps({
-            "released": True,
-            "owner": lease["owner"],
-        }, sort_keys=True))
-    elif action == "recover" and len(arguments) <= 2:
-        ttl = parse_duration(arguments[1] if len(arguments) == 2 else "300",
-                             "TTL", 0.1, MAX_TTL)
-        with locked_file("execution.lock"):
-            with locked_file("state.lock"):
-                lease = require_lease(
-                    allow_in_flight=True, allow_expired=True)
-                operation = lease.get("in_flight")
-                if operation is None:
-                    die("lease has no indeterminate operation to recover")
-                operation_id = operation["id"]
-                old_generation = operation["controller_generation"]
-            controller = validated_controller()
-            if controller["generation"] == old_generation:
-                die("controller generation is unchanged; restart the controller "
-                    "that could have executed the operation")
-            functional_health_check()
-            with locked_file("state.lock"):
-                lease = require_lease(
-                    allow_in_flight=True, allow_expired=True)
-                current = lease.get("in_flight", {})
-                if (current.get("id") != operation_id
-                        or current.get("controller_generation")
-                        != old_generation):
-                    die("lease in-flight state changed unexpectedly")
-                del lease["in_flight"]
-                lease["expires_at"] = time.time() + ttl
-                write_lease(lease)
-        print(json.dumps({
-            "recovered": True,
-            "owner": lease["owner"],
-            "controller_generation": controller["generation"],
-            "expires_at": lease["expires_at"],
-        }, sort_keys=True))
-    else:
-        die("usage: client.sh lease acquire OWNER [WAIT_SECONDS] [TTL_SECONDS] | "
-            "lease renew [TTL_SECONDS] | lease status | lease release | "
-            "lease recover [TTL_SECONDS]")
+HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+
+
+def read_body(response):
+    body = response.read(MAX_BODY + 1)
+    if len(body) > MAX_BODY:
+        fail(f"MCP response exceeds {MAX_BODY} bytes")
+    return body
 
 
 def decode(body, content_type):
     try:
-        text = body.decode("utf-8")
+        text = body.decode()
     except UnicodeDecodeError as exc:
-        die(f"MCP returned non-UTF-8 output: {exc}")
-    payloads = []
-    if "text/event-stream" in content_type:
-        current = []
+        fail(f"MCP returned non-UTF-8 output: {exc}")
+    media = content_type.split(";", 1)[0].lower()
+    if media == "application/json":
+        payloads = [text] if text.strip() else []
+    elif media == "text/event-stream":
+        payloads, current = [], []
         for line in text.splitlines() + [""]:
             if line.startswith("data:"):
                 current.append(line[5:].lstrip())
             elif not line and current:
                 payloads.append("\n".join(current))
                 current = []
-    elif text.strip():
-        payloads.append(text)
-    for payload in reversed(payloads):
-        try:
-            value = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    die("MCP returned empty or malformed JSON")
+    else:
+        fail(f"MCP returned unsupported Content-Type {content_type!r}")
+    try:
+        values = [json.loads(item, parse_constant=reject_constant)
+                  for item in payloads]
+    except json.JSONDecodeError as exc:
+        fail(f"MCP returned malformed JSON: {exc}")
+    if len(values) != 1 or not isinstance(values[0], dict):
+        fail("MCP returned empty or ambiguous JSON-RPC output")
+    validate_json(values[0])
+    return values[0]
 
 
-def post(message, session=None, response_required=True):
-    headers = {
-        "Accept": "application/json, text/event-stream",
-        "Content-Type": "application/json",
-    }
+def encode_message(message):
+    try:
+        body = json.dumps(
+            message, separators=(",", ":"), allow_nan=False).encode()
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        fail(f"MCP request is not strict encodable JSON: {exc}")
+    if len(body) > MAX_BODY:
+        fail("MCP request is too large")
+    return body
+
+
+def post(message, generation, session=None, protocol=None, notification=False,
+         body=None):
+    validate_controller(generation)
+    headers = {"Accept": "application/json, text/event-stream",
+               "Content-Type": "application/json"}
     if session:
-        headers["Mcp-Session-Id"] = session
-    request = urllib.request.Request(
-        URL, json.dumps(message, separators=(",", ":")).encode(), headers
-    )
+        headers.update({"Mcp-Session-Id": session,
+                        "Mcp-Protocol-Version": protocol})
+    body = encode_message(message) if body is None else body
+    request = urllib.request.Request(mcp_url(), body, headers, method="POST")
     try:
-        with HTTP.open(request, timeout=TIMEOUT) as response:
-            body = response.read()
-            new_session = response.headers.get("Mcp-Session-Id", session)
-            if not response_required:
-                return None, new_session
-            return decode(body, response.headers.get("Content-Type", "")), new_session
+        with HTTP.open(request, timeout=timeout()) as response:
+            if response.geturl() != mcp_url():
+                fail("MCP redirects are forbidden")
+            status, response_body = response.status, read_body(response)
+            response_session = response.headers.get("Mcp-Session-Id")
+            content_type = response.headers.get("Content-Type", "")
     except urllib.error.HTTPError as exc:
         detail = exc.read(2000).decode(errors="replace")
-        die(f"MCP HTTP {exc.code}: {detail}")
+        label = "redirect" if 300 <= exc.code < 400 else "error"
+        fail(f"MCP HTTP {label} {exc.code}: {detail}")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        die(f"MCP request failed: {exc}")
+        fail(f"MCP request failed: {exc}")
+    validate_controller(generation)
+    if notification:
+        if status != 202 or response_body:
+            fail("initialized notification did not return empty HTTP 202")
+        if response_session not in {None, session}:
+            fail("initialized notification changed the MCP session")
+        return None, session
+    if status != 200:
+        fail(f"MCP request returned HTTP {status}")
+    if session:
+        if response_session != session:
+            fail("MCP response omitted or changed the exact session")
+    elif (not isinstance(response_session, str)
+          or not 0 < len(response_session) <= 256):
+        fail("initialize omitted a valid MCP session ID")
+    return decode(response_body, content_type), response_session
 
 
-def delete_session(session):
+def delete(lease):
+    validate_controller(lease["controller_generation"],
+                        lease["cdp_endpoint"], lease["mcp_url"])
     request = urllib.request.Request(
-        URL,
-        headers={
-            "Mcp-Session-Id": session,
-            "Mcp-Protocol-Version": "2025-03-26",
-        },
-        method="DELETE",
-    )
+        lease["mcp_url"], method="DELETE",
+        headers={"Accept": "application/json",
+                 "Mcp-Session-Id": lease["session_id"],
+                 "Mcp-Protocol-Version": lease["protocol_version"]})
     try:
-        with HTTP.open(request, timeout=TIMEOUT) as response:
-            response.read()
+        with HTTP.open(request, timeout=timeout()) as response:
+            if response.geturl() != lease["mcp_url"]:
+                fail("MCP DELETE redirects are forbidden")
+            status, body = response.status, read_body(response)
+            response_session = response.headers.get("Mcp-Session-Id")
     except urllib.error.HTTPError as exc:
-        detail = exc.read(2000).decode(errors="replace")
-        die(f"MCP session DELETE HTTP {exc.code}: {detail}")
+        fail(f"MCP session DELETE HTTP {exc.code}: "
+             f"{exc.read(2000).decode(errors='replace')}")
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        die(f"MCP session DELETE failed: {exc}")
+        fail(f"MCP session DELETE failed: {exc}")
+    validate_controller(lease["controller_generation"],
+                        lease["cdp_endpoint"], lease["mcp_url"])
+    if status != 200 or body:
+        fail("MCP session DELETE did not return empty HTTP 200")
+    if response_session not in {None, lease["session_id"]}:
+        fail("MCP session DELETE returned a different session")
 
 
-def valid_list_result(result):
-    return (
-        isinstance(result, dict)
-        and isinstance(result.get("tools"), list)
-        and all(isinstance(tool, dict) for tool in result["tools"])
-    )
-
-
-def valid_call_result(result):
-    return (
-        isinstance(result, dict)
-        and isinstance(result.get("content"), list)
-        and all(valid_content_block(item) for item in result["content"])
-        and ("isError" not in result or type(result["isError"]) is bool)
-    )
-
-
-def valid_content_block(item):
-    if not isinstance(item, dict):
-        return False
-    if item.get("type") == "text":
-        return isinstance(item.get("text"), str)
-    if item.get("type") == "image":
-        if (item.get("mimeType") not in {"image/png", "image/jpeg"}
-                or not isinstance(item.get("data"), str)
-                or not item["data"]):
-            return False
-        try:
-            base64.b64decode(item["data"], validate=True)
-        except (binascii.Error, ValueError):
-            return False
-        return True
-    return False
-
-
-def checked(response, operation, request_id, result_validator):
-    if (not isinstance(response, dict)
-            or response.get("jsonrpc") != "2.0"
-            or type(response.get("id")) is not type(request_id)
-            or response.get("id") != request_id):
-        die(f"malformed or mismatched {operation} JSON-RPC response")
-    has_result = "result" in response
-    has_error = "error" in response
-    if has_result == has_error:
-        die(f"malformed {operation} JSON-RPC result/error envelope")
-    expected = {"jsonrpc", "id", "result" if has_result else "error"}
-    if set(response) != expected:
-        die(f"malformed {operation} JSON-RPC response fields")
-    if has_error:
-        error = response["error"]
-        if (not isinstance(error, dict)
-                or not {"code", "message"} <= error.keys()
+def check(response, label, request_id, validator):
+    if (not isinstance(response, dict) or response.get("jsonrpc") != "2.0"
+            or type(response.get("id")) is not int
+            or response["id"] != request_id):
+        fail(f"malformed or mismatched {label} response")
+    result, error = response.get("result"), response.get("error")
+    if ("result" in response) == ("error" in response) or set(response) != {
+            "jsonrpc", "id", "result" if "result" in response else "error"}:
+        fail(f"malformed {label} envelope")
+    if error is not None:
+        if (not isinstance(error, dict) or not {"code", "message"} <= error.keys()
                 or not set(error) <= {"code", "message", "data"}
                 or type(error["code"]) is not int
                 or not isinstance(error["message"], str)):
-            die(f"malformed {operation} JSON-RPC error")
+            fail(f"malformed {label} error")
         return None, error
-    if not result_validator(response["result"]):
-        die(f"malformed {operation} result")
-    return response["result"], None
+    if not validator(result):
+        fail(f"malformed {label} result")
+    return result, None
 
 
-def fail_rpc_error(operation, error):
-    die(f"{operation} JSON-RPC error: {json.dumps(error)}")
+def valid_init(value):
+    return (isinstance(value, dict)
+            and {"protocolVersion", "capabilities", "serverInfo"} <= value.keys()
+            and value["protocolVersion"] == PROTOCOL
+            and isinstance(value["capabilities"], dict)
+            and isinstance(value["serverInfo"], dict)
+            and isinstance(value["serverInfo"].get("name"), str)
+            and isinstance(value["serverInfo"].get("version"), str))
 
 
-def parse_sequence(value):
+def valid_tools(value):
+    return (isinstance(value, dict) and set(value) <= {"tools", "nextCursor"}
+            and isinstance(value.get("tools"), list)
+            and all(isinstance(tool, dict)
+                    and isinstance(tool.get("name"), str)
+                    and isinstance(tool.get("inputSchema"), dict)
+                    for tool in value["tools"]))
+
+
+def valid_block(value):
+    if not isinstance(value, dict):
+        return False
+    if value.get("type") == "text":
+        return isinstance(value.get("text"), str)
+    if (value.get("type") != "image"
+            or value.get("mimeType") not in {"image/png", "image/jpeg"}
+            or not isinstance(value.get("data"), str)):
+        return False
     try:
-        calls = json.loads(value)
-    except json.JSONDecodeError as exc:
-        die(f"sequence is malformed JSON: {exc}")
-    if not isinstance(calls, list):
-        die("sequence must be a JSON array")
-    if not 1 <= len(calls) <= MAX_SEQUENCE_CALLS:
-        die(f"sequence must contain 1-{MAX_SEQUENCE_CALLS} tool calls")
-    for index, call in enumerate(calls, 1):
-        if not isinstance(call, dict) or set(call) != {"name", "arguments"}:
-            die(f"sequence item {index} must contain exactly name and arguments")
-        if not isinstance(call["name"], str) or not call["name"]:
-            die(f"sequence item {index} name must be a nonempty string")
-        if not isinstance(call["arguments"], dict):
-            die(f"sequence item {index} arguments must be a JSON object")
-    return calls
+        base64.b64decode(value["data"], validate=True)
+        return bool(value["data"])
+    except (binascii.Error, ValueError):
+        return False
 
 
-def initialize_session():
-    initialized, session = post({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "browserctl", "version": "0.2.0"},
-        },
-    })
-    _, error = checked(
-        initialized, "initialize", 1, lambda result: isinstance(result, dict))
-    if error is not None:
-        fail_rpc_error("initialize", error)
-    if not session:
-        die("initialize response omitted Mcp-Session-Id")
-    post(
-        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
-        session,
-        response_required=False,
-    )
-    return session
+def valid_call(value):
+    return (isinstance(value, dict)
+            and set(value) <= {"content", "isError", "structuredContent"}
+            and isinstance(value.get("content"), list)
+            and all(valid_block(block) for block in value["content"])
+            and ("isError" not in value or type(value["isError"]) is bool))
 
 
-def functional_health_check():
-    session = initialize_session()
+def operation(kind, method, request_id):
+    return {"kind": kind, "method": method, "request_id": request_id,
+            "started_at": time.time()}
+
+
+def quarantine(lease, reason):
+    lease.update({"phase": "recovery_required", "client": None,
+                  "operation": None, "receipt": None, "reason": reason[:1000]})
+    write_lease(lease)
+
+
+def persist_operation(lease, method, kind="request", request_id=True):
+    identifier = lease["next_request_id"] if request_id else None
+    if request_id:
+        lease["next_request_id"] += 1
+    lease["operation"] = operation(kind, method, identifier)
+    with lock("state.lock"):
+        write_lease(lease)
+    return identifier
+
+
+def initialize(lease):
+    identifier = persist_operation(lease, "initialize")
+    response, session = post({
+        "jsonrpc": "2.0", "id": identifier, "method": "initialize",
+        "params": {"protocolVersion": PROTOCOL, "capabilities": {},
+                   "clientInfo": {"name": "browserctl", "version": "1.0"}}},
+        lease["controller_generation"])
+    result, error = check(response, "initialize", identifier, valid_init)
+    if error:
+        fail(f"initialize error: {json.dumps(error)}")
+    lease.update({"session_id": session,
+                  "protocol_version": result["protocolVersion"]})
+    persist_operation(lease, "notifications/initialized",
+                      "notification", False)
+    post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+         lease["controller_generation"], session, lease["protocol_version"], True)
+    identifier = persist_operation(lease, "tools/list")
     response, _ = post(
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
-        session,
-    )
-    _, error = checked(
-        response, "controller health tools/list", 2, valid_list_result)
-    if error is not None:
-        delete_session(session)
-        fail_rpc_error("controller health tools/list", error)
+        {"jsonrpc": "2.0", "id": identifier, "method": "tools/list", "params": {}},
+        lease["controller_generation"], session, lease["protocol_version"])
+    tools, error = check(response, "acquire tools/list", identifier, valid_tools)
+    if error:
+        fail(f"acquire tools/list error: {json.dumps(error)}")
+    if not any(tool["name"] == "browser_tabs" for tool in tools["tools"]):
+        fail("acquire tools/list omitted browser_tabs")
+    identifier = persist_operation(lease, "tools/call browser_tabs")
     response, _ = post({
-        "jsonrpc": "2.0",
-        "id": 3,
-        "method": "tools/call",
-        "params": {
-            "name": "browser_tabs",
-            "arguments": {"action": "list"},
-        },
-    }, session)
-    result, error = checked(
-        response, "controller health browser_tabs", 3, valid_call_result)
-    delete_session(session)
-    if error is not None:
-        fail_rpc_error("controller health browser_tabs", error)
-    if result.get("isError") is True:
-        die(f"controller browser health probe failed: {json.dumps(result)}")
+        "jsonrpc": "2.0", "id": identifier, "method": "tools/call",
+        "params": {"name": "browser_tabs", "arguments": {"action": "list"}}},
+        lease["controller_generation"], session, lease["protocol_version"])
+    result, error = check(response, "acquire browser_tabs", identifier, valid_call)
+    if error or result.get("isError"):
+        fail(f"acquire browser_tabs failed: {json.dumps(error or result)}")
+    lines = [line.strip() for block in result["content"]
+             if block["type"] == "text" for line in block["text"].splitlines()]
+    if not any(line.startswith("- ") and line[2:].split(":", 1)[0].isdigit()
+               for line in lines):
+        fail("acquire browser_tabs returned an empty health result")
+    validate_controller(lease["controller_generation"],
+                        lease["cdp_endpoint"], lease["mcp_url"])
+    lease.update({"phase": "ready", "client": None, "operation": None})
+    with lock("state.lock"):
+        write_lease(lease)
+    return lease
+
+
+def new_lease(owner, controller):
+    return {"schema_version": VERSION, "phase": "initializing", "owner": owner,
+            "acquired_at": time.time(), "mcp_url": controller["mcp_url"],
+            "cdp_endpoint": controller["cdp_endpoint"],
+            "controller_generation": controller["generation"],
+            "session_id": None, "protocol_version": None, "next_request_id": 1,
+            "client": client(), "operation": operation(
+                "request", "initialize", 1),
+            "receipt": None, "reason": None}
+
+
+def display(lease):
+    if lease["phase"] in {"initializing", "in_progress", "closing"}:
+        return "in_progress" if alive(lease["client"]) else "recovery_required"
+    return lease["phase"]
+
+
+def controller_matches(lease):
+    try:
+        validate_controller(lease["controller_generation"],
+                            lease["cdp_endpoint"], lease["mcp_url"])
+        return True
+    except Error:
+        return False
+
+
+def acquire(owner, wait):
+    if (not owner or len(owner) > 200
+            or any(ord(char) < 32 or ord(char) == 127 for char in owner)):
+        fail("lease owner must be 1-200 printable characters")
+    deadline = time.monotonic() + wait
+    while True:
+        with lock("state.lock"):
+            existing = read_lease(True)
+        if existing is None:
+            remaining = max(0, deadline - time.monotonic())
+            with lock("execution.lock", remaining):
+                with lock("state.lock"):
+                    existing = read_lease(True)
+                if existing is not None:
+                    held, phase = existing["owner"], display(existing)
+                    continue
+                controller = validate_controller()
+                lease = new_lease(owner, controller)
+                with lock("state.lock"):
+                    if read_lease(True) is not None:
+                        fail("lease appeared during acquire")
+                    write_lease(lease)
+                try:
+                    lease = initialize(lease)
+                except Error as exc:
+                    with lock("state.lock"):
+                        quarantine(read_lease(), f"acquire failed: {exc}")
+                    raise
+                output({"acquired": True, "owner": owner,
+                        "controller_generation": lease["controller_generation"],
+                        "cdp_endpoint": lease["cdp_endpoint"],
+                        "session_id": lease["session_id"],
+                        "protocol_version": lease["protocol_version"]})
+                return
+        held, phase = existing["owner"], display(existing)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fail(f"lease held by {held!r} in state {phase!r}")
+        time.sleep(min(.05, remaining))
+
+
+def status():
+    with lock("state.lock"):
+        lease = read_lease(True)
+        if lease is None:
+            value = {"state": "available", "available": True}
+        else:
+            validate_config(lease["cdp_endpoint"], lease["mcp_url"])
+            state = display(lease)
+            if state == "ready" and not controller_matches(lease):
+                state = "recovery_required"
+            value = {"state": state, "available": False, "owner": lease["owner"],
+                     "phase": lease["phase"],
+                     "controller_generation": lease["controller_generation"],
+                     "cdp_endpoint": lease["cdp_endpoint"],
+                     "session_id": lease["session_id"],
+                     "protocol_version": lease["protocol_version"],
+                     "next_request_id": lease["next_request_id"]}
+            if lease["client"]:
+                value.update({"client": lease["client"],
+                              "client_alive": alive(lease["client"]),
+                              "operation": lease["operation"]})
+            if lease["receipt"]:
+                value["result"] = {key: lease["receipt"][key] for key in
+                                   ("id", "request_id", "method", "exit_code",
+                                    "completed_at")}
+            if lease["reason"]:
+                value["reason"] = lease["reason"]
+    output(value)
+
+
+def require_ready(lease):
+    state = display(lease)
+    if state == "result_pending":
+        fail("completed result pending; run lease result")
+    if state != "ready":
+        fail(f"lease is {state}; recovery is required")
+
+
+def receipt(request_id, method, stdout, stderr, code):
+    try:
+        too_large = (len(stdout.encode()) > MAX_BODY
+                     or len(stderr.encode()) > MAX_BODY)
+    except UnicodeEncodeError:
+        too_large = True
+    if too_large:
+        stdout = ""
+        stderr = (
+            "browserctl: MCP operation completed, but its result was too large "
+            "or not UTF-8 encodable for the durable receipt; do not replay the "
+            "browser action\n")
+        code = 1
+    return {"id": secrets.token_hex(16), "request_id": request_id,
+            "method": method, "stdout": stdout, "stderr": stderr,
+            "exit_code": code, "completed_at": time.time()}
+
+
+def deliver(value):
+    try:
+        sys.stdout.write(value["stdout"])
+        sys.stderr.write(value["stderr"])
+        sys.stdout.flush()
+        sys.stderr.flush()
+        return True
+    except (BrokenPipeError, OSError):
+        return False
+
+
+def result():
+    with lock("execution.lock"):
+        with lock("state.lock"):
+            lease = read_lease()
+            if lease["phase"] != "result_pending":
+                fail("lease has no pending result")
+            pending = lease["receipt"]
+        if not deliver(pending):
+            raise SystemExit(1)
+        with lock("state.lock"):
+            lease = read_lease()
+            if (lease["phase"] != "result_pending"
+                    or lease["receipt"]["id"] != pending["id"]):
+                fail("pending result changed unexpectedly")
+            lease.update({"phase": "ready", "receipt": None})
+            write_lease(lease)
+        raise SystemExit(pending["exit_code"])
+
+
+def call(name=None, arguments=None):
+    listing = name is None
+    with lock("execution.lock"):
+        with lock("state.lock"):
+            lease = read_lease()
+            require_ready(lease)
+            validate_config(lease["cdp_endpoint"], lease["mcp_url"])
+            try:
+                validate_controller(lease["controller_generation"],
+                                    lease["cdp_endpoint"], lease["mcp_url"])
+            except Error as exc:
+                quarantine(lease, f"controller validation failed: {exc}")
+                raise
+            identifier = lease["next_request_id"]
+            method = "tools/list" if listing else "tools/call"
+            operation_name = method if listing else f"{method} {name}"
+            params = {} if listing else {"name": name, "arguments": arguments}
+            message = {"jsonrpc": "2.0", "id": identifier,
+                       "method": method, "params": params}
+            body = encode_message(message)
+            lease.update({"phase": "in_progress", "client": client(),
+                          "next_request_id": identifier + 1,
+                          "operation": operation(
+                              "request", operation_name, identifier)})
+            write_lease(lease)
+        response, _ = post(
+            message,
+            lease["controller_generation"], lease["session_id"],
+            lease["protocol_version"], body=body)
+        value, rpc_error = check(
+            response, method, identifier, valid_tools if listing else valid_call)
+        if rpc_error:
+            pending = receipt(
+                identifier, operation_name, "",
+                f"browserctl: {method} error: {json.dumps(rpc_error)}\n", 1)
+        elif not listing and value.get("isError"):
+            pending = receipt(
+                identifier, operation_name, "",
+                f"browserctl: Playwright tool error: {json.dumps(value)}\n", 1)
+        else:
+            pending = receipt(
+                identifier, operation_name,
+                json.dumps(value, indent=2, sort_keys=True,
+                           ensure_ascii=False) + "\n", "", 0)
+        with lock("state.lock"):
+            current = read_lease()
+            if (current["phase"] != "in_progress"
+                    or current["operation"]["request_id"] != identifier):
+                fail("in-progress state changed unexpectedly")
+            current.update({"phase": "result_pending", "client": None,
+                            "operation": None, "receipt": pending})
+            write_lease(current)
+        if not deliver(pending):
+            raise SystemExit(1)
+        with lock("state.lock"):
+            current = read_lease()
+            if current["receipt"]["id"] != pending["id"]:
+                fail("pending result changed unexpectedly")
+            current.update({"phase": "ready", "receipt": None})
+            write_lease(current)
+        raise SystemExit(pending["exit_code"])
+
+
+def release():
+    with lock("execution.lock"):
+        with lock("state.lock"):
+            lease = read_lease()
+            require_ready(lease)
+            validate_config(lease["cdp_endpoint"], lease["mcp_url"])
+            try:
+                validate_controller(lease["controller_generation"],
+                                    lease["cdp_endpoint"], lease["mcp_url"])
+            except Error as exc:
+                quarantine(lease, f"release validation failed: {exc}")
+                raise
+            lease.update({"phase": "closing", "client": client(),
+                          "operation": operation("delete", "DELETE", None)})
+            write_lease(lease)
+        delete(lease)
+        with lock("state.lock"):
+            current = read_lease()
+            if current["phase"] != "closing":
+                fail("closing state changed unexpectedly")
+            remove_lease()
+        output({"released": True, "owner": lease["owner"]})
+
+
+def recover():
+    with lock("execution.lock"):
+        with lock("state.lock"):
+            lease = read_lease()
+            validate_config(lease["cdp_endpoint"], lease["mcp_url"])
+            phase = display(lease)
+            if phase == "in_progress":
+                fail("operation is still live")
+            if phase == "result_pending":
+                fail("completed result pending; run lease result")
+            if phase == "ready" and controller_matches(lease):
+                fail("ready lease does not need recovery")
+            if phase not in {"ready", "recovery_required"}:
+                fail(f"lease in state {phase} cannot be recovered")
+            controller = validate_controller()
+            if controller["generation"] == lease["controller_generation"]:
+                fail("controller generation is unchanged")
+            if (controller["cdp_endpoint"] != lease["cdp_endpoint"]
+                    or controller["mcp_url"] != lease["mcp_url"]):
+                fail("recovery controller does not use the same endpoints")
+            old = lease["controller_generation"]
+            lease.update({"phase": "initializing",
+                          "controller_generation": controller["generation"],
+                          "session_id": None, "protocol_version": None,
+                          "next_request_id": 1, "client": client(),
+                          "operation": operation("request", "initialize", 1),
+                          "receipt": None, "reason": None})
+            write_lease(lease)
+        try:
+            lease = initialize(lease)
+        except Error as exc:
+            with lock("state.lock"):
+                quarantine(read_lease(), f"recovery failed: {exc}")
+            raise
+        output({"recovered": True, "owner": lease["owner"],
+                "previous_controller_generation": old,
+                "controller_generation": lease["controller_generation"],
+                "session_id": lease["session_id"],
+                "session_state_lost": True,
+                "next_action": "inspect tabs and snapshot; do not replay"})
+
+
+def output(value):
+    try:
+        print(json.dumps(value, sort_keys=True, ensure_ascii=False), flush=True)
+    except (BrokenPipeError, OSError):
+        raise SystemExit(1)
+
+
+def lease_command(arguments):
+    if arguments[:1] == ["status"] and len(arguments) == 1:
+        status()
+    elif arguments[:1] == ["acquire"] and 2 <= len(arguments) <= 3:
+        acquire(arguments[1], duration(
+            arguments[2] if len(arguments) == 3 else "0",
+            "wait", 0, MAX_WAIT))
+    elif arguments == ["result"]:
+        result()
+    elif arguments == ["release"]:
+        release()
+    elif arguments == ["recover"]:
+        recover()
+    else:
+        fail("usage: client.sh lease acquire OWNER [WAIT_SECONDS] | "
+             "lease status|result|release|recover")
 
 
 def main():
-    if len(sys.argv) >= 2 and sys.argv[1] == "controller":
-        if len(sys.argv) >= 3 and sys.argv[2] == "register":
-            register_controller(sys.argv[3:])
-            return
-        die("internal controller command is invalid")
-    if len(sys.argv) >= 2 and sys.argv[1] == "lease":
+    outer = duration(os.getenv("BROWSERCTL_TIMEOUT", "120"),
+                     "outer timeout", 1, 3600)
+    if outer <= timeout():
+        fail("outer timeout must exceed HTTP timeout")
+    if sys.argv[1:3] == ["controller", "register"]:
+        register(sys.argv[3:])
+    elif sys.argv[1:2] == ["lease"]:
         lease_command(sys.argv[2:])
-        return
-    if len(sys.argv) == 2 and sys.argv[1] == "list":
-        operations = [("tools/list", {})]
-        sequence = False
+    elif sys.argv[1:] == ["list"]:
+        call()
     elif len(sys.argv) == 4 and sys.argv[1] == "call":
         try:
-            arguments = json.loads(sys.argv[3])
+            arguments = json.loads(
+                sys.argv[3], parse_constant=reject_constant)
         except json.JSONDecodeError as exc:
-            die(f"tool arguments are malformed JSON: {exc}")
-        if not isinstance(arguments, dict):
-            die("tool arguments must be a JSON object")
-        operations = [(
-            "tools/call",
-            {"name": sys.argv[2], "arguments": arguments},
-        )]
-        sequence = False
-    elif len(sys.argv) == 3 and sys.argv[1] == "sequence":
-        calls = parse_sequence(sys.argv[2])
-        operations = [
-            ("tools/call", {"name": call["name"], "arguments": call["arguments"]})
-            for call in calls
-        ]
-        sequence = True
+            fail(f"tool arguments are malformed JSON: {exc}")
+        if not sys.argv[2] or not isinstance(arguments, dict):
+            fail("tool name must be nonempty and arguments must be an object")
+        validate_json(arguments)
+        call(sys.argv[2], arguments)
     else:
-        die("usage: client.sh lease ... | client.sh list | "
-            "client.sh call TOOL JSON_OBJECT | "
-            "client.sh sequence JSON_ARRAY")
-
-    with locked_file("execution.lock"):
-        with locked_file("state.lock"):
-            require_lease()
-        controller = validated_controller()
-        session = initialize_session()
-        operation_id = secrets.token_hex(16)
-        with locked_file("state.lock"):
-            lease = require_lease()
-            lease["in_flight"] = {
-                "id": operation_id,
-                "method": operations[0][0],
-                "started_at": time.time(),
-                "controller_generation": controller["generation"],
-            }
-            write_lease(lease)
-        results = []
-        determinate_error = None
-        for item, (method, params) in enumerate(operations, 1):
-            request_id = item + 1
-            operation = (
-                f"sequence item {item} tools/call"
-                if sequence else method
-            )
-            response, response_session = post({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": params,
-            }, session)
-            if response_session != session:
-                die(f"{operation} changed the MCP session ID")
-            validator = (
-                valid_call_result if method == "tools/call"
-                else valid_list_result
-            )
-            result, error = checked(
-                response, operation, request_id, validator)
-            if error is not None:
-                determinate_error = ("rpc", operation, error)
-                break
-            results.append(result)
-            if method == "tools/call" and result.get("isError") is True:
-                determinate_error = ("tool", operation, result)
-                break
-        delete_session(session)
-        with locked_file("state.lock"):
-            lease = require_lease(
-                allow_in_flight=True, allow_expired=True)
-            if lease.get("in_flight", {}).get("id") != operation_id:
-                die("lease in-flight state changed unexpectedly")
-            del lease["in_flight"]
-            write_lease(lease)
-        if determinate_error is not None:
-            kind, operation, error = determinate_error
-            if kind == "rpc":
-                fail_rpc_error(operation, error)
-            if sequence:
-                die(f"Playwright tool error in {operation}: "
-                    f"{json.dumps(error)}")
-            die(f"Playwright tool error: {json.dumps(error)}")
-    output = results if sequence else results[0]
-    print(json.dumps(output, indent=2, sort_keys=True))
+        fail("usage: client.sh lease ... | list | call TOOL JSON_OBJECT")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Error as exc:
+        print(f"browserctl: {exc}", file=sys.stderr)
+        raise SystemExit(1)
