@@ -1,10 +1,10 @@
 # browserctl
 
-`browserctl` gives one cooperating workflow fail-closed access to an already-running Edge profile. It never launches, stops, or selects Edge. The stable manually started user service owns one pinned-version Playwright MCP child and one warm session across tasks.
+`browserctl` gives one cooperating browser agent at a time access to an already-running Edge profile. It never launches, stops, or selects Edge. A manually started user service owns one pinned Playwright MCP child and keeps one warm session across tasks. The Unix account is the boundary; there are no tokens, authentication, or queues.
 
-## Configure
+## Configure and install
 
-Create `${XDG_CONFIG_HOME:-$HOME/.config}/browserctl/host.json`, owned by the user and mode `0600`. Its exact schema has no defaults or unknown keys:
+Create `${XDG_CONFIG_HOME:-$HOME/.config}/browserctl/host.json` with this exact schema:
 
 ```json
 {
@@ -17,22 +17,19 @@ Create `${XDG_CONFIG_HOME:-$HOME/.config}/browserctl/host.json`, owned by the us
 }
 ```
 
-The command selects exactly MCP version `0.0.78`; npm cache/package integrity is outside browserctl and is not guaranteed. With only internal `eDP`/`LVDS`/`DSI` outputs, `human` is selected; any external output selects `agent`. Both profiles may run simultaneously. The selected profile's `SingletonLock`, exact top-level PID/executable/profile descriptors, and sole numeric-loopback CDP listener must agree.
-
-## Install and start manually
+Only internal `eDP`/`LVDS`/`DSI` outputs select `human`; any external output selects `agent`. The selected profile's `SingletonLock`, Edge executable and arguments, profile path, CDP port, and CDP availability must agree. An operator or agent may configure and install missing pieces using first-hand host values:
 
 ```bash
 install -d -m 0700 "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-install -m 0644 browserctl-controller.service \
-  "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/browserctl-controller.service"
+install -m 0644 browserctl-controller.service "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/browserctl-controller.service"
 systemctl --user daemon-reload
 ./browserctl.py doctor
 systemctl --user start browserctl-controller.service
 ```
 
-The unit is static, `Type=notify`, and manual-only. Direct/transient launch is rejected. READY is sent only after stable-unit identity, legacy/foreign-controller absence, selected Edge identity, and the warm MCP session are validated.
+The static `Type=notify` unit is manual-only. It announces READY after the selected Edge identity and warm MCP `0.0.78` session are ready.
 
-## Task workflow
+## Use
 
 ```bash
 ./browserctl.py task begin "agent: description"
@@ -40,20 +37,16 @@ The unit is static, `Type=notify`, and manual-only. Direct/transient launch is r
 ./browserctl.py tab list
 ./browserctl.py tab select INDEX
 ./browserctl.py call browser_snapshot '{}'
-./browserctl.py tools
-./browserctl.py call browser_navigate '{"url":"https://example.com"}'
+# Use tab new/list/select/close, tools, and call as needed.
+./browserctl.py tab close INDEX
 ./browserctl.py task end
 ```
 
-The enforced phase order is `new → list → select → snapshot → ARMED`. From ARMED, `tab list` deliberately returns to SELECT so a popup or tab switch can be corrected with select and snapshot. Raw tabs/config/close/unsafe tools are forbidden. General calls require ARMED. Ref targets require a fresh nonempty snapshot; every attempted non-snapshot call conservatively invalidates it.
+The owner is descriptive, not authorization. While `READY`, tab commands, `tools`, `call`, and `task end` are available in any order. MCP decides whether arguments and refs are valid. Raw `browser_tabs`, `browser_get_config`, and run-code tools are allowed; only `browser_close` is hidden and blocked because it closes the shared browser.
 
-Each dispatch is durably `RUNNING` before transmission and `RESULT` before output. A completed result too large to persist enters `RECOVERY` with explicit do-not-replay evidence. A client ACK returns a normal result to `READY`; after disconnect, use `./browserctl.py result` without replaying. Daemon replacement changes old `READY`/`RUNNING` work to `RECOVERY`; an old `RESULT` stays retrievable and then becomes `RECOVERY`.
+Every dispatch is durably `RUNNING` before MCP transmission and `RESULT` before output. ACK returns it to `READY`; after a disconnect, `result` retrieves it without replay. A normal MCP/tool error exits 1 and ACKs back to `READY`. Inspect tabs or snapshot and continue from observed state: a failed `tab new`, for example, may still have created a tab.
 
-After daemon replacement, recovery enforces `task recover → tab list → tab select INDEX → browser_snapshot`. Recovery never replays. `task end` is local, READY-only, and keeps the warm session.
-
-## Operator-only idle cutover
-
-There is no migration or deletion of legacy `controller.json`, `lease.json`, or other unexpected state. While the legacy controller is explicitly idle, stop only that controller, move the entire old `${XDG_STATE_HOME:-$HOME/.local/state}/browserctl` directory to a recoverable archive, create no replacement files manually, and then start the new stable unit. Never archive active or uncertain work, and never stop Edge.
+Restarting rebinds `READY` work to the new daemon generation. An old `RESULT` remains retrievable and ACKs to `READY`; an old `RUNNING` becomes `RECOVERY`. `task recover` adopts the new generation without replay or command restrictions, while `task end` may abandon `READY` or `RECOVERY`.
 
 ## Tests
 
@@ -62,4 +55,4 @@ python3 -W error::ResourceWarning -m unittest -v test_browserctl.py
 python3 -W error::ResourceWarning -m unittest -v test_real_integration.py
 ```
 
-The first suite uses fake MCP, systemd, xrandr, and simultaneous fake profiles. The second uses cached exact MCP `0.0.78`, a temporary Edge profile, temporary ports, and no live browser state.
+Both suites use disposable profiles and state; the integration uses cached MCP `0.0.78` and temporary Edge/CDP ports.

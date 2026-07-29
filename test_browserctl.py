@@ -73,7 +73,8 @@ class H(BaseHTTPRequestHandler):
         if method == "tools/list":
             names = ["browser_tabs","browser_snapshot","browser_click",
                      "browser_navigate","browser_get_config","browser_close",
-                     "browser_run_code","browser_run_code_unsafe","bad_id","die"]
+                     "browser_run_code","browser_run_code_unsafe",
+                     "bad_id","rpc_error","die"]
             result = {"tools":[{"name":item,"inputSchema":{"type":"object"}}
                                for item in names]}
         elif method == "tools/call":
@@ -82,13 +83,21 @@ class H(BaseHTTPRequestHandler):
             if name == "bad_id":
                 return self.reply(200, {"jsonrpc":"2.0","id":999,
                     "result":{"content":[{"type":"text","text":"bad"}]}})
+            if name == "rpc_error":
+                return self.reply(200, {"jsonrpc":"2.0","id":message["id"],
+                    "error":{"code":-32001,"message":"determinate failure"}})
             if name == "browser_tabs":
                 action = arguments["action"]
-                if current == "fail_" + action:
+                if action == "new" and current == "fail_new_after_create":
+                    tab += 1
+                    result = {"content":[{"type":"text","text":"created then failed"}],
+                              "isError":True}
+                elif current == "fail_" + action:
                     result = {"content":[{"type":"text","text":"failed"}],"isError":True}
                 else:
                     if action == "new": tab += 1
                     elif action == "select": tab = arguments["index"]
+                    elif action == "close": tab = max(0, tab - 1)
                     result = {"content":[{"type":"text","text":f"{action} tab {tab}"}]}
             elif name == "browser_snapshot":
                 result = {"content":[] if current == "empty_snapshot" else
@@ -98,16 +107,6 @@ class H(BaseHTTPRequestHandler):
                           "isError": current == "fail_call"}
         else: return self.reply(400)
         return self.reply(200, {"jsonrpc":"2.0","id":message["id"],"result":result})
-if os.environ.get("FAKE_FOREIGN_LISTENER"):
-    intermediate = os.fork()
-    if intermediate == 0:
-        parent = os.getpid()
-        if os.fork() == 0:
-            while os.getppid() == parent: time.sleep(.01)
-            ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
-        os._exit(0)
-    os.waitpid(intermediate, 0)
-    while True: time.sleep(1)
 ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
 '''
 
@@ -288,14 +287,6 @@ class BrowserctlTests(unittest.TestCase):
     def calls(self, name):
         return [item for item in self.read_events() if item.get("name") == name]
 
-    def ack_workflow(self):
-        self.run_ctl("task", "begin", "test")
-        self.run_ctl("tab", "new")
-        self.run_ctl("tab", "list")
-        self.run_ctl("tab", "select", "1")
-        self.run_ctl("call", "browser_snapshot", "{}")
-        self.assertEqual(self.task()["phase"], "ARMED")
-
     def test_two_profiles_and_doctor_select_only_policy_pid(self):
         result = json.loads(self.run_ctl("doctor").stdout)
         self.assertEqual(result["edge_pid"], self.edge[0].pid)
@@ -303,77 +294,182 @@ class BrowserctlTests(unittest.TestCase):
         active = json.loads(self.run_ctl("doctor").stdout)
         self.assertEqual(active["edge_pid"], self.edge[1].pid)
 
-    def test_direct_and_transient_daemon_rejected_before_mcp(self):
+    def test_selected_edge_tree_must_own_configured_listener(self):
+        self.stop_daemon()
+        selected = self.edge.pop(0)
+        self.stop_process(selected)
+        (self.human / "SingletonLock").unlink()
+        (self.base / f"edge-{self.ports[0]}.ready").unlink(missing_ok=True)
+        unrelated = self.base / "unrelated"
+        unrelated.mkdir()
+        self.start_edge(unrelated, self.ports[0])
+        selected = subprocess.Popen([
+            sys.executable, "-c", "import time; time.sleep(20)",
+            f"--remote-debugging-port={self.ports[0]}",
+            f"--user-data-dir={self.human}"],
+            stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.edge.append(selected)
+        (self.human / "SingletonLock").symlink_to(
+            f"{socket.gethostname()}-{selected.pid}")
+        failed = self.run_ctl(
+            "doctor", check=False, env={"FAKE_SERVICE_STATE": "inactive"})
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("does not own the CDP listener", failed.stderr)
+
+    def test_direct_daemon_rejected_before_mcp(self):
         self.stop_daemon()
         before = len(self.read_events())
-        error = self.start_daemon(
-            {"FAKE_FRAGMENT": str(self.base / "transient.service")},
-            expect_fail=True)
-        self.assertIn("transient", error)
-        self.assertEqual(len(self.read_events()), before)
         direct = subprocess.run(
             [CTL, "daemon"], env={key: value for key, value in self.env.items()
                                  if key != "NOTIFY_SOCKET"},
             text=True, capture_output=True, timeout=5)
         self.assertNotEqual(direct.returncode, 0)
-        self.assertIn("exact stable service", direct.stderr)
+        self.assertIn("service MainPID", direct.stderr)
+        self.assertEqual(len(self.read_events()), before)
 
-    def test_legacy_state_refused_without_mutation(self):
-        self.stop_daemon()
-        legacy = self.state / "browserctl/controller.json"
-        legacy.write_text('{"schema_version":3}')
-        legacy.chmod(0o600)
-        before = legacy.read_bytes()
-        error = self.start_daemon(expect_fail=True)
-        self.assertIn("operator archival", error)
-        self.assertEqual(legacy.read_bytes(), before)
-
-    def test_phase_machine_failed_new_select_and_snapshot(self):
-        self.run_ctl("task", "begin", "phase")
-        blocked = self.run_ctl("tab", "list", check=False)
-        self.assertIn("tab list", blocked.stderr)
-        self.mode.write_text("fail_new")
-        self.assertNotEqual(self.run_ctl("tab", "new", check=False).returncode, 0)
-        self.assertEqual(self.task()["phase"], "NEW")
+    def test_failed_new_can_reconcile_continue_and_end(self):
+        self.run_ctl("task", "begin", "reconcile")
+        self.mode.write_text("fail_new_after_create")
+        failed = self.run_ctl("tab", "new", check=False)
+        self.assertEqual(failed.returncode, 1)
+        self.assertEqual(self.status()["state"], "READY")
         self.mode.write_text("healthy")
-        self.run_ctl("tab", "new")
-        self.assertEqual(self.task()["phase"], "LIST")
-        self.run_ctl("tab", "list")
-        self.mode.write_text("fail_select")
-        self.assertNotEqual(self.run_ctl("tab", "select", "1", check=False).returncode, 0)
-        self.assertEqual(self.task()["phase"], "SELECT")
-        self.mode.write_text("healthy")
+        self.assertIn("list tab 1", self.run_ctl("tab", "list").stdout)
         self.run_ctl("tab", "select", "1")
-        self.assertEqual(self.task()["phase"], "SNAPSHOT")
+        self.run_ctl("call", "browser_snapshot", "{}")
+        self.run_ctl("call", "browser_navigate", '{"url":"https://example.com"}')
+        self.run_ctl("task", "end")
+        self.assertEqual(self.status()["state"], "IDLE")
+
+    def test_calls_have_no_artificial_tab_snapshot_or_ref_gate(self):
+        self.run_ctl("task", "begin", "ungated")
+        self.run_ctl("call", "browser_navigate", "{}")
+        self.run_ctl("call", "browser_click", '{"target":"e999"}')
         self.mode.write_text("empty_snapshot")
-        self.assertNotEqual(self.run_ctl(
-            "call", "browser_snapshot", "{}", check=False).returncode, 0)
-        self.assertEqual(self.task()["phase"], "SNAPSHOT")
-        self.assertFalse(self.task()["snapshot"])
-        self.mode.write_text("healthy")
         self.run_ctl("call", "browser_snapshot", "{}")
-        self.assertEqual(self.task()["phase"], "ARMED")
         self.run_ctl("tab", "list")
-        self.assertEqual(self.task()["phase"], "SELECT")
-        self.assertFalse(self.task()["snapshot"])
-        blocked = self.run_ctl(
-            "call", "browser_navigate", "{}", check=False)
-        self.assertIn("new/list/select/snapshot", blocked.stderr)
-        self.run_ctl("tab", "select", "1")
-        self.run_ctl("call", "browser_snapshot", "{}")
-        self.assertEqual(self.task()["phase"], "ARMED")
+        self.run_ctl("tab", "new")
+        self.run_ctl("tab", "close", "1")
+        self.run_ctl("task", "end")
 
-    def test_refs_and_failed_mutation_conservatively_clear_snapshot(self):
-        self.ack_workflow()
-        self.mode.write_text("fail_call")
-        self.assertNotEqual(self.run_ctl(
-            "call", "browser_navigate", "{}", check=False).returncode, 0)
-        self.assertFalse(self.task()["snapshot"])
-        before = len(self.calls("browser_click"))
-        blocked = self.run_ctl(
-            "call", "browser_click", '{"target":"e1"}', check=False)
-        self.assertIn("fresh browser_snapshot", blocked.stderr)
-        self.assertEqual(len(self.calls("browser_click")), before)
+    def test_raw_tools_and_run_code_allowed_but_browser_close_blocked(self):
+        self.run_ctl("task", "begin", "tools")
+        listed = json.loads(self.run_ctl("tools").stdout)
+        names = {tool["name"] for tool in listed["tools"]}
+        self.assertTrue({
+            "browser_tabs", "browser_get_config", "browser_run_code",
+            "browser_run_code_unsafe"} <= names)
+        self.assertNotIn("browser_close", names)
+        for name, arguments in (
+                ("browser_tabs", '{"action":"list"}'),
+                ("browser_get_config", "{}"),
+                ("browser_run_code", '{"code":"async page => 1"}'),
+                ("browser_run_code_unsafe", '{"code":"async page => 1"}')):
+            self.run_ctl("call", name, arguments)
+        before = len(self.calls("browser_close"))
+        blocked = self.run_ctl("call", "browser_close", "{}", check=False)
+        self.assertIn("forbidden", blocked.stderr)
+        self.assertEqual(len(self.calls("browser_close")), before)
+        self.assertEqual(self.status()["state"], "READY")
+        self.run_ctl("task", "end")
+
+    def test_jsonrpc_error_is_durable_exit_one_then_ack_ready(self):
+        self.run_ctl("task", "begin", "rpc-error")
+        with socket.socket(socket.AF_UNIX) as stream:
+            stream.connect(str(self.runtime / "browserctl.sock"))
+            browserctl.send_message(stream, {
+                "id": "rpc-error", "command": "call",
+                "args": ["rpc_error", {}], "build": browserctl.BUILD})
+            response = browserctl.recv_message(stream)
+            receipt = response["value"]
+            self.assertTrue(response["ok"])
+            self.assertEqual(receipt["exit_code"], 1)
+            self.assertIn("determinate failure", receipt["stderr"])
+            self.assertEqual(self.task()["state"], "RESULT")
+            browserctl.send_message(stream, {"ack": receipt["id"]})
+            self.assertEqual(
+                browserctl.recv_message(stream)["acked"], receipt["id"])
+        self.assertEqual(self.status()["state"], "READY")
+        self.assertIsNone(self.task()["receipt"])
+        self.run_ctl("task", "end")
+
+    def test_task_end_from_ready_after_begin_success_and_tool_error(self):
+        paths = (
+            lambda: None,
+            lambda: self.run_ctl("tab", "list"),
+            lambda: self.run_ctl("call", "browser_navigate", "{}",
+                                 check=False))
+        for index, action in enumerate(paths):
+            with self.subTest(index=index):
+                self.run_ctl("task", "begin", f"end-{index}")
+                if index == 2:
+                    self.mode.write_text("fail_call")
+                action()
+                self.assertEqual(self.status()["state"], "READY")
+                self.run_ctl("task", "end")
+                self.assertEqual(self.status()["state"], "IDLE")
+                self.mode.write_text("healthy")
+
+    def test_legacy_ready_new_migrates_once_and_restart_rebinds(self):
+        self.run_ctl("task", "begin", "legacy-ready")
+        old_generation = self.task()["generation"]
+        self.stop_daemon()
+        path = self.state / "browserctl/task.json"
+        legacy = self.task()
+        legacy.update({"phase": "NEW", "snapshot": False})
+        path.write_text(json.dumps(legacy))
+        path.chmod(0o600)
+        with mock.patch.dict(os.environ, self.env):
+            migrated = browserctl.read_task(False)
+            first = path.read_bytes()
+            browserctl.read_task(False)
+        self.assertEqual(path.read_bytes(), first)
+        self.assertEqual(migrated["owner"], "legacy-ready")
+        self.assertEqual(migrated["generation"], old_generation)
+        self.assertEqual(set(migrated), browserctl.TASK_KEYS)
+        self.start_daemon()
+        self.assertEqual(self.status()["state"], "READY")
+        self.assertNotEqual(self.task()["generation"], old_generation)
+        self.run_ctl("task", "end")
+
+    def test_malformed_legacy_result_is_not_migrated(self):
+        self.stop_daemon()
+        legacy = browserctl.new_task("malformed", "0" * 32)
+        legacy.update({
+            "state": "RESULT", "phase": "ARMED", "snapshot": False,
+            "receipt": {
+                "id": "receipt", "request_id": "request",
+                "stdout": "", "stderr": "", "exit_code": 1,
+                "success": "not-a-boolean", "post": {}}})
+        path = self.state / "browserctl/task.json"
+        path.write_text(json.dumps(legacy))
+        before = path.read_bytes()
+        with mock.patch.dict(os.environ, self.env), \
+             self.assertRaisesRegex(browserctl.Error, "legacy result"):
+            browserctl.read_task(False)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_old_running_can_recover_or_be_abandoned(self):
+        for outcome in ("recover", "end"):
+            with self.subTest(outcome=outcome):
+                self.run_ctl("task", "begin", f"old-running-{outcome}")
+                self.stop_daemon()
+                task = self.task()
+                task.update({
+                    "state": "RUNNING", "operation": {
+                        "id": "uncertain", "method": "call browser_navigate"}})
+                path = self.state / "browserctl/task.json"
+                path.write_text(json.dumps(task))
+                path.chmod(0o600)
+                self.start_daemon()
+                self.assertEqual(self.status()["state"], "RECOVERY")
+                if outcome == "recover":
+                    self.run_ctl("task", "recover")
+                    self.assertEqual(self.status()["state"], "READY")
+                    self.run_ctl("call", "browser_snapshot", "{}")
+                    self.run_ctl("tab", "list")
+                self.run_ctl("task", "end")
+                self.assertEqual(self.status()["state"], "IDLE")
 
     def test_identity_drift_quarantines_without_dispatch(self):
         self.run_ctl("task", "begin", "drift")
@@ -384,83 +480,62 @@ class BrowserctlTests(unittest.TestCase):
         self.assertEqual(self.status()["state"], "RECOVERY")
         self.assertEqual(len(self.calls("browser_tabs")), before)
 
-    def test_duplicate_json_and_session_syntax(self):
-        self.run_ctl("task", "begin", "strict")
-        failed = self.run_ctl(
-            "call", "browser_snapshot", '{"x":1,"x":2}', check=False)
-        self.assertIn("duplicate key", failed.stderr)
+    def test_mcp_session_syntax(self):
         self.assertTrue(browserctl.valid_session("abc-123"))
         for bad in ("", "bad session", "x\n", "x" * 257):
             self.assertFalse(browserctl.valid_session(bad))
 
-    def test_invalid_mcp_session_and_foreign_controller_refused(self):
+    def test_strict_json_rejects_duplicates_and_nonfinite_numbers(self):
+        with self.assertRaisesRegex(browserctl.Error, "duplicate key"):
+            browserctl.strict_load('{"x":1,"x":2}')
+        for value in ("NaN", "Infinity", "-Infinity", "1e999"):
+            with self.subTest(value=value), \
+                 self.assertRaisesRegex(browserctl.Error, "number"):
+                browserctl.strict_load(value)
+
+    def test_corrupt_task_types_raise_browserctl_error(self):
+        self.stop_daemon()
+        path = self.state / "browserctl/task.json"
+        cases = []
+        task = browserctl.new_task("corrupt", "0" * 32)
+        task["state"] = []
+        cases.append(task)
+        task = browserctl.new_task("corrupt", "0" * 32)
+        task["generation"] = []
+        cases.append(task)
+        task = browserctl.new_task("corrupt", "0" * 32)
+        task.update({
+            "state": "RUNNING",
+            "operation": {"id": [], "method": "call"}})
+        cases.append(task)
+        task = browserctl.new_task("corrupt", "0" * 32)
+        task.update({
+            "state": "RESULT",
+            "receipt": {
+                "id": "r", "request_id": "q", "stdout": "", "stderr": "",
+                "exit_code": []}})
+        cases.append(task)
+        with mock.patch.dict(os.environ, self.env):
+            for task in cases:
+                with self.subTest(task=task), \
+                     self.assertRaises(browserctl.Error):
+                    path.write_text(json.dumps(task))
+                    browserctl.read_task(False)
+
+    def test_tool_success_requires_content_list_not_known_block_types(self):
+        mcp = browserctl.MCP.__new__(browserctl.MCP)
+        mcp.call_raw = lambda *_: {"content": [{"type": "future-block"}]}
+        self.assertEqual(
+            mcp.call("future", {})["content"], [{"type": "future-block"}])
+        mcp.call_raw = lambda *_: {"content": {"type": "text"}}
+        with self.assertRaisesRegex(browserctl.Error, "tool result"):
+            mcp.call("malformed", {})
+
+    def test_invalid_mcp_session_is_rejected(self):
         self.stop_daemon()
         error = self.start_daemon(
             {"FAKE_SESSION": "bad session"}, expect_fail=True)
         self.assertIn("session", error)
-        cdp = f"http://127.0.0.1:{self.ports[0]}"
-        foreign = subprocess.Popen(
-            [sys.executable, "-c", "import time; time.sleep(10)",
-             "playwright-mcp", cdp], start_new_session=True)
-        try:
-            error = self.start_daemon(expect_fail=True)
-            self.assertIn("foreign or legacy", error)
-        finally:
-            os.killpg(foreign.pid, signal.SIGTERM)
-            foreign.wait(2)
-
-    def test_mcp_listener_must_belong_to_child_tree(self):
-        self.stop_daemon()
-        initialized = len([
-            item for item in self.read_events()
-            if item["method"] == "initialize"])
-        error = self.start_daemon(
-            {"FAKE_FOREIGN_LISTENER": "1"}, expect_fail=True)
-        self.assertIn("listener", error)
-        self.assertEqual(len([
-            item for item in self.read_events()
-            if item["method"] == "initialize"]), initialized)
-
-    def test_group_cleanup_refuses_changed_leader_identity(self):
-        child = subprocess.Popen(["sleep", "10"], start_new_session=True)
-        mcp = browserctl.MCP.__new__(browserctl.MCP)
-        mcp.child, mcp.child_start = child, "wrong"
-        try:
-            with self.assertRaisesRegex(browserctl.Error, "identity changed"):
-                mcp.close()
-            self.assertIsNone(child.poll())
-        finally:
-            os.killpg(child.pid, signal.SIGTERM)
-            child.wait(2)
-
-    def test_group_cleanup_kills_term_resistant_survivor(self):
-        ready = self.base / "survivor.ready"
-        survivor = (
-            "import os,signal,sys,time,pathlib;"
-            "os.setpgrp();"
-            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
-            "pathlib.Path(sys.argv[1]).write_text('ready');"
-            "time.sleep(20)")
-        leader = subprocess.Popen([
-            sys.executable, "-c",
-            "import subprocess,sys,time;"
-            f"subprocess.Popen([{sys.executable!r},'-c',{survivor!r},sys.argv[1]]);"
-            "time.sleep(20)", str(ready)], start_new_session=True)
-        deadline = time.monotonic() + 2
-        while not ready.exists() and time.monotonic() < deadline:
-            time.sleep(.01)
-        self.assertTrue(ready.exists())
-        mcp = browserctl.MCP.__new__(browserctl.MCP)
-        mcp.child = leader
-        mcp.child_start = browserctl.process_info(leader.pid)["start"]
-        try:
-            with mock.patch.object(browserctl, "IO_TIMEOUT", .1):
-                mcp.close()
-            self.assertFalse(browserctl.group_members(leader.pid))
-        finally:
-            if browserctl.group_members(leader.pid):
-                os.killpg(leader.pid, signal.SIGKILL)
-            leader.wait(2)
 
     def test_oversized_completed_result_requires_recovery(self):
         self.stop_daemon()
@@ -474,37 +549,25 @@ class BrowserctlTests(unittest.TestCase):
             with self.assertRaisesRegex(browserctl.Error, "do not replay"):
                 daemon.dispatch(
                     task, "oversized-id", "tab new",
-                    lambda: {"content": [{"type": "text", "text": "x" * 500}]},
-                    {"phase": "LIST"})
+                    lambda: {"content": [{"type": "text", "text": "x" * 500}]})
             journal = self.task()
         self.assertEqual(journal["state"], "RECOVERY")
         self.assertIsNone(journal["receipt"])
         self.assertIn("completed", journal["reason"])
         self.assertIn("do not replay", journal["reason"])
 
-    def test_stale_socket_probe_timeout_preserves_socket(self):
+    def test_stale_socket_is_replaced(self):
         self.stop_daemon()
         path = self.runtime / "browserctl.sock"
         stale = socket.socket(socket.AF_UNIX)
         stale.bind(str(path))
-        os.chmod(path, 0o600)
-        probe = mock.MagicMock()
-        probe.__enter__.return_value = probe
-        probe.connect_ex.side_effect = socket.timeout("bounded")
-        try:
-            with mock.patch.object(browserctl.socket, "socket",
-                                   return_value=probe), \
-                 mock.patch.object(browserctl, "IO_TIMEOUT", .1):
-                with self.assertRaisesRegex(browserctl.Error, "ambiguous"):
-                    browserctl.remove_stale_socket(path)
-            probe.settimeout.assert_called_once_with(.1)
-            self.assertTrue(path.exists())
-        finally:
-            stale.close()
-            path.unlink(missing_ok=True)
+        stale.close()
+        self.assertTrue(path.exists())
+        browserctl.remove_stale_socket(path)
+        self.assertFalse(path.exists())
 
-    def test_result_disconnect_recovery_and_no_replay(self):
-        self.ack_workflow()
+    def test_result_disconnect_restart_rebind_and_no_replay(self):
+        self.run_ctl("task", "begin", "lost-result")
         stream = socket.socket(socket.AF_UNIX)
         stream.connect(str(self.runtime / "browserctl.sock"))
         browserctl.send_message(stream, {
@@ -518,17 +581,20 @@ class BrowserctlTests(unittest.TestCase):
             time.sleep(.02)
         self.assertEqual(len(self.calls("browser_navigate")), 1)
         self.stop_daemon()
+        path = self.state / "browserctl/task.json"
+        legacy = self.task()
+        legacy.update({"phase": "ARMED", "snapshot": False})
+        legacy["receipt"].update({"success": True, "post": {}})
+        path.write_text(json.dumps(legacy))
+        path.chmod(0o600)
         self.start_daemon()
         self.run_ctl("result")
-        self.assertEqual(self.status()["state"], "RECOVERY")
+        self.assertEqual(self.status()["state"], "READY")
         self.assertEqual(len(self.calls("browser_navigate")), 1)
-        self.run_ctl("task", "recover")
-        self.assertEqual(self.task()["phase"], "LIST")
-        self.assertNotEqual(self.run_ctl("tab", "new", check=False).returncode, 0)
-        self.run_ctl("tab", "list")
-        self.run_ctl("tab", "select", "1")
+        self.assertEqual(set(self.task()), browserctl.TASK_KEYS)
         self.run_ctl("call", "browser_snapshot", "{}")
-        self.assertEqual(self.task()["phase"], "ARMED")
+        self.run_ctl("tab", "new")
+        self.run_ctl("task", "end")
 
     def test_initial_request_ack_and_client_response_stalls_are_bounded(self):
         stream = socket.socket(socket.AF_UNIX)
@@ -536,7 +602,7 @@ class BrowserctlTests(unittest.TestCase):
         time.sleep(browserctl.IO_TIMEOUT + .2)
         stream.close()
         self.assertEqual(self.status()["state"], "IDLE")
-        self.ack_workflow()
+        self.run_ctl("task", "begin", "ack-stall")
         stalled = socket.socket(socket.AF_UNIX)
         stalled.connect(str(self.runtime / "browserctl.sock"))
         browserctl.send_message(stalled, {

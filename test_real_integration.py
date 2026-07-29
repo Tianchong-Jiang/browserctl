@@ -37,6 +37,21 @@ def dependencies():
     return edge, npx, missing
 
 
+def processes_with(argument):
+    found = []
+    needle = argument.encode()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if needle in command:
+            found.append(int(entry.name))
+    return found
+
+
 class RealIntegration(unittest.TestCase):
     def test_disposable_edge_and_exact_cached_mcp(self):
         edge_command, npx_command, missing = dependencies()
@@ -46,7 +61,8 @@ class RealIntegration(unittest.TestCase):
                 ", ".join(missing))
         edge_launcher = Path(edge_command).absolute()
         npx = Path(npx_command).absolute()
-        edge = daemon = notify = mcp_group = None
+        edge = daemon = notify = None
+        mcp_marker = None
         with tempfile.TemporaryDirectory(prefix="browserctl-real-") as name:
             base = Path(name)
             config, state = base / "config", base / "state"
@@ -143,22 +159,15 @@ class RealIntegration(unittest.TestCase):
                         f"daemon did not become ready: {stdout} {stderr}; "
                         f"lock={lock_pid} port={cdp} argv={argv}")
                 self.assertIn(b"READY=1", notice)
-                groups = []
-                for entry in Path("/proc").iterdir():
-                    if not entry.name.isdigit():
-                        continue
-                    pid = int(entry.name)
-                    info = browserctl.process_info(pid)
-                    if (info and info["pgrp"] == info["session"] == pid and
-                            browserctl.descendant(pid, daemon.pid)):
-                        groups.append(pid)
-                self.assertEqual(len(groups), 1, "exact MCP group not found")
-                mcp_group = groups[0]
+                mcp_marker = f"http://127.0.0.1:{cdp}"
+                self.assertTrue(
+                    processes_with(mcp_marker), "warm MCP process not found")
                 for args in (
                     ["task", "begin", "disposable integration"],
                     ["tab", "new"], ["tab", "list"],
                     ["tab", "select", "1"],
-                    ["call", "browser_snapshot", "{}"], ["task", "end"]):
+                    ["call", "browser_snapshot", "{}"],
+                    ["tab", "close", "1"], ["task", "end"]):
                     result = subprocess.run(
                         [CTL, *args], env=env, text=True,
                         capture_output=True, timeout=30)
@@ -169,14 +178,13 @@ class RealIntegration(unittest.TestCase):
                 if daemon and daemon.poll() is None:
                     daemon.terminate()
                     daemon.wait(5)
-                if mcp_group:
+                if mcp_marker:
                     deadline = time.monotonic() + 2
-                    while (browserctl.group_members(mcp_group) and
+                    while (processes_with(mcp_marker) and
                            time.monotonic() < deadline):
                         time.sleep(.02)
                     self.assertFalse(
-                        browserctl.group_members(mcp_group),
-                        "real MCP process group leaked")
+                        processes_with(mcp_marker), "real MCP process leaked")
                 if daemon:
                     daemon.stdout.close()
                     daemon.stderr.close()
