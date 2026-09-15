@@ -1,14 +1,13 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Small controller for one warm Playwright MCP browser session."""
 import hashlib, json, math, os
 from pathlib import Path
 import pwd, re, secrets, signal, socket, subprocess, sys, tempfile, time
-import urllib.error, urllib.parse, urllib.request
+import urllib.error, urllib.request
 SCHEMA, PROTOCOL = 1, '2025-03-26'
 MAX, HTTP_TIMEOUT, IO_TIMEOUT = 16 * 1024 * 1024, 90, 2
 BUILD = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-CONFIG_KEYS = {'schema_version', 'hostname', 'user', 'human', 'agent', 'mcp_command'}
-PROFILE_KEYS = {'edge_exe', 'profile', 'cdp_endpoint'}
+CONFIG_KEYS = {'schema_version', 'hostname', 'user', 'chrome_exe', 'profile', 'cdp_endpoint', 'npx', 'agent_region', 'human_region'}
 TASK_KEYS = {'schema_version', 'state', 'owner', 'generation',
              'operation', 'receipt', 'reason'}
 
@@ -109,19 +108,10 @@ def remove_task():
         fail(f'cannot durably remove task journal: {exc}')
 
 def endpoint(value, label):
-    try:
-        parsed = urllib.parse.urlsplit(value)
-        port = parsed.port
-    except (TypeError, ValueError) as exc:
-        fail(f'{label} is invalid: {exc}')
-    require(parsed.scheme == 'http' and
-            parsed.hostname in {'127.0.0.1', '::1'} and port is not None and
-            1 <= port <= 65535 and not any((parsed.path, parsed.query,
-            parsed.fragment, parsed.username, parsed.password)),
-            f'{label} must be canonical numeric-loopback HTTP with a port')
-    host = f'[{parsed.hostname}]' if parsed.hostname == '::1' else parsed.hostname
-    require(value == f'http://{host}:{port}', f'{label} is not canonical')
-    return parsed
+    match = re.fullmatch(r'http://127\.0\.0\.1:([1-9][0-9]{0,4})', value)
+    require(match is not None and int(match[1]) <= 65535,
+            f'{label} must be http://127.0.0.1:PORT')
+    return int(match[1])
 
 def load_config():
     path = Path(os.getenv('XDG_CONFIG_HOME', Path.home() / '.config')) / 'browserctl/host.json'
@@ -132,46 +122,22 @@ def load_config():
             value['hostname'] == socket.gethostname() and
             value['user'] == pwd.getpwuid(os.getuid()).pw_name,
             'host config identity does not match this host and user')
-    for name in ('human', 'agent'):
-        profile = value[name]
-        require(isinstance(profile, dict) and set(profile) == PROFILE_KEYS,
-                f'host config {name} profile has an unsupported schema')
-        for key in ('edge_exe', 'profile'):
-            if not isinstance(profile[key], str) or not Path(profile[key]).is_absolute():
-                fail(f'host config {name}.{key} must be absolute')
-        endpoint(profile['cdp_endpoint'], f'host config {name}.cdp_endpoint')
-    require(Path(value['human']['profile']).resolve() !=
-            Path(value['agent']['profile']).resolve() and
-            value['human']['cdp_endpoint'] != value['agent']['cdp_endpoint'],
-            'human and agent browser identities are ambiguous')
-    command = value['mcp_command']
-    require(isinstance(command, list) and len(command) == 3 and
-            command[1:] == ['--yes', '@playwright/mcp@0.0.78'] and
-            isinstance(command[0], str) and Path(command[0]).is_absolute(),
-            'mcp_command must be [ABS_NPX, "--yes", "@playwright/mcp@0.0.78"]')
-    require(Path(command[0]).is_file() and os.access(command[0], os.X_OK),
-            'mcp_command executable is missing or not executable')
+    for key in ('chrome_exe', 'profile', 'npx'):
+        require(isinstance(value[key], str) and Path(value[key]).is_absolute(),
+                f'host config {key} must be absolute')
+    endpoint(value['cdp_endpoint'], 'host config cdp_endpoint')
+    for key in ('agent_region', 'human_region'):
+        region = value[key]
+        require(set(region) == {'left', 'top', 'width', 'height'} and
+                all(type(v) is int for v in region.values()) and
+                region['width'] > 0 and region['height'] > 0,
+                f'host config {key} must specify integer bounds with positive dimensions')
     return value
 
-def display_profile(config):
-    try:
-        result = subprocess.run(['xrandr', '--query'], text=True, capture_output=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        fail(f'cannot inspect displays: {exc}')
-    require(result.returncode == 0, f'xrandr failed: {result.stderr.strip()}')
-    connected = [match.group(1) for line in result.stdout.splitlines() if (match := re.match('^(\\S+)\\s+connected(?:\\s|$)', line))]
-    require(connected, 'xrandr reported no connected display')
-    internal = ('eDP', 'LVDS', 'DSI')
-    name = 'agent' if any(not output.startswith(internal) for output in connected) else 'human'
-    return name, config[name]
-
-def listener_inode(host, port):
-    table, address = (
-        ('/proc/net/tcp', '0100007F') if host == '127.0.0.1' else
-        ('/proc/net/tcp6', '00000000000000000000000001000000'))
-    local = f'{address}:{port:04X}'
+def listener_inode(port):
+    local = f'0100007F:{port:04X}'
     matches = []
-    for line in Path(table).read_text().splitlines()[1:]:
+    for line in Path('/proc/net/tcp').read_text().splitlines()[1:]:
         fields = line.split()
         if fields[1] == local and fields[3] == '0A':
             matches.append(fields[9])
@@ -179,38 +145,21 @@ def listener_inode(host, port):
             'selected CDP endpoint is not one exact loopback listener')
     return matches[0]
 
-def tree_owns_listener(root, inode):
+def owns_listener(pid, inode):
     target = f'socket:[{inode}]'
-    pending, seen = [root], set()
-    while pending:
-        pid = pending.pop()
-        require(type(pid) is int and pid > 0 and pid not in seen,
-                'selected Edge process tree is malformed')
-        seen.add(pid)
-        process = Path(f'/proc/{pid}')
-        try:
-            child_tokens = (
-                process / f'task/{pid}/children').read_text().split()
-            descriptors = list((process / 'fd').iterdir())
-        except OSError:
-            return False
-        require(all(token.isdecimal() and int(token) > 0
-                    for token in child_tokens),
-                'selected Edge child list is malformed')
-        pending.extend(int(token) for token in child_tokens)
-        for descriptor in descriptors:
+    try:
+        for descriptor in Path(f'/proc/{pid}/fd').iterdir():
             try:
                 if os.readlink(descriptor) == target:
                     return True
-            except OSError:
-                pass
+            except FileNotFoundError:
+                continue
+    except OSError:
+        return False
     return False
 
-def edge_identity(config):
-    name, profile = display_profile(config)
-    profile_path = Path(profile['profile'])
-    if not Path(profile['edge_exe']).is_file() or not profile_path.is_dir():
-        fail(f'selected {name} Edge executable or profile is missing')
+def chrome_identity(config):
+    profile_path = Path(config['profile'])
     try:
         lock = os.readlink(profile_path / 'SingletonLock')
     except OSError as exc:
@@ -227,40 +176,36 @@ def edge_identity(config):
         argv = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')[:-1]
         argv = [item.decode('utf-8') for item in argv]
     except (OSError, UnicodeError, IndexError, ValueError) as exc:
-        fail(f'cannot inspect selected Edge process: {exc}')
-    if owner != os.getuid() or state == 'Z' or exe != profile['edge_exe']:
-        fail('selected Edge PID owner, liveness, or executable is wrong')
+        fail(f'cannot inspect selected Chrome process: {exc}')
+    if owner != os.getuid() or state == 'Z' or exe != config['chrome_exe']:
+        fail('selected Chrome PID owner, liveness, or executable is wrong')
     command = '\0'.join(argv)
     boundary = r'(?:^|[ \0])'
     if re.search(boundary + r'--type=', command):
-        fail('selected Edge PID is not a top-level browser process')
-    parsed = endpoint(profile['cdp_endpoint'], 'selected CDP endpoint')
-    port_flag = f'--remote-debugging-port={parsed.port}'
+        fail('selected Chrome PID is not a top-level browser process')
+    port = endpoint(config['cdp_endpoint'], 'selected CDP endpoint')
+    port_flag = f'--remote-debugging-port={port}'
     if not re.search(boundary + re.escape(port_flag) + r'(?:$|[ \0])', command):
-        fail(f'selected Edge PID lacks {port_flag}')
-    profile_flag = f"--user-data-dir={profile['profile']}"
+        fail(f'selected Chrome PID lacks {port_flag}')
+    profile_flag = f"--user-data-dir={config['profile']}"
     if not re.search(
             boundary + re.escape(profile_flag) + r'(?:$|[ \0])', command):
-        fail('selected Edge PID has the wrong user-data-dir')
-    inode = listener_inode(parsed.hostname, parsed.port)
-    require(tree_owns_listener(pid, inode),
-            'selected Edge process tree does not own the CDP listener')
-    return {'selector': name, 'pid': pid, 'start': start, 'exe': exe,
-            'profile': profile['profile'], 'cdp': profile['cdp_endpoint']}
+        fail('selected Chrome PID has the wrong user-data-dir')
+    inode = listener_inode(port)
+    require(owns_listener(pid, inode),
+            'selected Chrome process does not own the CDP listener')
+    return {'pid': pid, 'start': start, 'exe': exe,
+            'profile': config['profile'], 'cdp': config['cdp_endpoint']}
 
-def valid_receipt(receipt, legacy=False):
+def valid_receipt(receipt):
     keys = {'id', 'request_id', 'stdout', 'stderr', 'exit_code'}
-    if legacy:
-        keys |= {'success', 'post'}
     valid = (
         isinstance(receipt, dict) and set(receipt) == keys and
         all(isinstance(receipt[key], str)
             for key in ('id', 'request_id', 'stdout', 'stderr')) and
         type(receipt['exit_code']) is int and
         receipt['exit_code'] in {0, 1})
-    return valid and (not legacy or
-                      type(receipt['success']) is bool and
-                      isinstance(receipt['post'], dict))
+    return valid
 
 def validate_task(value):
     valid = (
@@ -292,29 +237,10 @@ def validate_task(value):
         fail('task journal fields disagree with its state')
     return value
 
-def migrate_task(value):
-    if not isinstance(value, dict) or set(value) != TASK_KEYS | {
-            'phase', 'snapshot'}:
-        return value
-    migrated = dict(value)
-    phase, snapshot = migrated.pop('phase'), migrated.pop('snapshot')
-    require(isinstance(phase, str) and
-            phase in {'NEW', 'LIST', 'SELECT', 'SNAPSHOT', 'ARMED'} and
-            type(snapshot) is bool, 'task journal is malformed or unsupported')
-    if migrated.get('state') == 'RESULT':
-        require(valid_receipt(migrated.get('receipt'), legacy=True),
-                'legacy result receipt is malformed')
-        receipt = dict(migrated['receipt'])
-        del receipt['success'], receipt['post']
-        migrated['receipt'] = receipt
-    validate_task(migrated)
-    write_task(migrated)
-    return migrated
-
 def read_task(missing=True):
     path = state_dir() / 'task.json'
     try:
-        return validate_task(migrate_task(read_json(path, 'task journal')))
+        return validate_task(read_json(path, 'task journal'))
     except Error:
         if missing and (not path.exists()):
             return None
@@ -358,9 +284,8 @@ def valid_session(value):
     return isinstance(value, str) and re.fullmatch(r'[!-~]{1,256}', value) is not None
 
 class MCP:
-    def __init__(self, config, identity):
+    def __init__(self, config):
         self.config = config
-        self.profile = config[identity['selector']]
         self.child = None
         self.session = None
         self.next_id = 1
@@ -371,8 +296,9 @@ class MCP:
 
     def start(self):
         authority = f'127.0.0.1:{self.port}'
-        argv = self.config['mcp_command'] + [
-            '--cdp-endpoint', self.profile['cdp_endpoint'],
+        argv = [self.config['npx'], '--yes', '@playwright/mcp@0.0.78',
+            '--init-page', str(Path(__file__).with_name('background-page.cjs')),
+            '--cdp-endpoint', self.config['cdp_endpoint'],
             '--shared-browser-context', '--caps=config',
             '--host', '127.0.0.1', '--allowed-hosts', authority,
             '--port', str(self.port)]
@@ -557,9 +483,9 @@ class Daemon:
 
     def validate_identity(self, task=None):
         try:
-            current = edge_identity(self.config)
+            current = chrome_identity(self.config)
             if current != self.identity:
-                fail('selected display or Edge identity changed')
+                fail('Chrome identity changed')
         except Error as exc:
             if task:
                 recovery(task, f'browser identity drift: {exc}')
@@ -613,13 +539,11 @@ class Daemon:
             write_task(task)
             return ({'state': 'READY', 'owner': task['owner']}, None)
         if command == 'result':
-            require(not args, 'result takes no arguments')
             task = read_task(False)
             if task['state'] != 'RESULT':
                 fail('no result is pending')
             return (task['receipt'], task['receipt']['id'])
         if command == 'task_recover':
-            require(not args, 'task recover takes no arguments')
             task = read_task(False)
             if task['state'] != 'RECOVERY':
                 fail('task is not in RECOVERY')
@@ -631,7 +555,6 @@ class Daemon:
             write_task(task)
             return ({'state': 'READY'}, None)
         if command == 'task_end':
-            require(not args, 'task end takes no arguments')
             task = read_task(False)
             if task['state'] == 'RESULT':
                 fail('result pending; run result')
@@ -641,7 +564,6 @@ class Daemon:
             return ({'state': 'IDLE', 'owner': task['owner']}, None)
         task = self.require_ready()
         if command == 'tools':
-            require(not args, 'tools takes no arguments')
             receipt = self.dispatch(task, rid, 'tools', self.mcp.tools)
         elif command == 'call':
             if len(args) != 2 or not isinstance(args[0], str) or (not args[0]) or (not isinstance(args[1], dict)):
@@ -667,8 +589,8 @@ class Daemon:
     def serve(self):
         for signum in (signal.SIGTERM, signal.SIGINT): signal.signal(signum, stop_signal)
         verify_service(starting=True)
-        self.identity = edge_identity(self.config)
-        self.mcp = MCP(self.config, self.identity)
+        self.identity = chrome_identity(self.config)
+        self.mcp = MCP(self.config)
         path = socket_path()
         remove_stale_socket(path)
         self.server = socket.socket(socket.AF_UNIX)
@@ -722,8 +644,6 @@ class Daemon:
 
 def send_message(stream, value):
     body = json_bytes(value)
-    if b'\n' in body:
-        fail('protocol message contains a newline')
     stream.sendall(body + b'\n')
 
 def recv_message(stream):
@@ -737,10 +657,7 @@ def recv_message(stream):
             line, rest = bytes(body).split(b'\n', 1)
             if rest:
                 fail('protocol peer sent trailing data')
-            try:
-                text = line.decode('utf-8')
-            except UnicodeDecodeError as exc:
-                fail(f'protocol message is not UTF-8: {exc}')
+            text = line.decode('utf-8')
             value = strict_load(text, 'protocol message')
             return value
     fail('protocol message is too large')
@@ -769,16 +686,18 @@ def client(command, args, quiet=False):
             fail(response['error'])
         value = response['value']
         if command in {'tools', 'call', 'result'}:
-            if not isinstance(value, dict) or not {'id', 'stdout', 'stderr', 'exit_code'} <= set(value):
-                fail('daemon result receipt is malformed')
-            sys.stdout.write(value['stdout'])
-            sys.stderr.write(value['stderr'])
+            if not quiet:
+                sys.stdout.write(value['stdout'])
+                sys.stderr.write(value['stderr'])
             sys.stdout.flush()
             sys.stderr.flush()
             send_message(stream, {'ack': value['id']})
             stream.settimeout(IO_TIMEOUT)
             if recv_message(stream) != {'acked': value['id'], 'build': BUILD}:
                 fail('daemon acknowledgement confirmation mismatch')
+            if quiet:
+                require(value['exit_code'] == 0, value['stderr'])
+                return strict_load(value['stdout'])
             return value['exit_code']
         if quiet:
             return value
@@ -798,10 +717,7 @@ def verify_service(starting=False):
         fail(f'cannot inspect browserctl service: {result.stderr.strip()}')
     fields = dict(line.split('=', 1) for line in result.stdout.splitlines()
                   if '=' in line)
-    try:
-        main_pid = int(fields['MainPID'])
-    except (KeyError, ValueError):
-        fail('service MainPID is malformed')
+    main_pid = int(fields['MainPID'])
     if starting:
         require(fields.get('ActiveState') == 'activating' and
                 os.getenv('NOTIFY_SOCKET') and main_pid == os.getpid(),
@@ -833,8 +749,8 @@ def notify_ready():
 def doctor():
     config = load_config()
     service = verify_service()
-    identity = edge_identity(config)
-    print(json.dumps({'ok': True, 'edge_pid': identity['pid'],
+    identity = chrome_identity(config)
+    print(json.dumps({'ok': True, 'chrome_pid': identity['pid'],
                       'profile': identity['profile'], 'service': service},
                      sort_keys=True))
 
@@ -843,20 +759,134 @@ SIMPLE_CLI = {
     ('task', 'end'): ('task_end', []), ('tools',): ('tools', []),
     ('result',): ('result', [])}
 
-def tab_cli(argv):
-    if len(argv) not in {2, 3} or argv[0] != 'tab' or argv[1] not in {
-            'new', 'list', 'select', 'close'}:
-        return None
-    action, arguments = argv[1], {'action': argv[1]}
-    if action in {'select', 'close'}:
-        if len(argv) != 3 or not argv[2].isdigit():
-            fail(f'tab {action} requires a nonnegative INDEX')
-        arguments['index'] = int(argv[2])
-    elif len(argv) != 2:
-        fail(f'tab {action} takes no arguments')
-    return client('call', ['browser_tabs', arguments])
+def agent_cli(code):
+    config = load_config()
+    identity = chrome_identity(config)
+    binding = read_json(Path(os.getenv('XDG_CONFIG_HOME', Path.home() / '.config')) /
+                        'browserctl/agent-window.json', 'agent window binding')
+    require(binding['pid'] == identity['pid'] and binding['start'] == identity['start'],
+            'agent window binding belongs to another browser; run startup setup')
+    require(code.strip(), 'agent expects an async function on stdin')
+    wrapper = """async (rootPage) => {
+      const binding = BINDING;
+      for (const page of rootPage.context().pages()) {
+        const session = await page.context().newCDPSession(page);
+        try {
+          const {targetInfo} = await session.send('Target.getTargetInfo');
+          if (targetInfo.targetId !== binding.targetId) continue;
+          const window = await session.send('Browser.getWindowForTarget', {targetId: targetInfo.targetId});
+          if (window.windowId !== binding.windowId) throw new Error('Agent tab moved to another window');
+          const b = window.bounds, r = binding.region;
+          if (b.windowState !== 'normal' || b.left < r.left - 8 || b.top < r.top - 8 ||
+              b.left + b.width > r.left + r.width + 8 || b.top + b.height > r.top + r.height + 8)
+            throw new Error('Agent window is outside its assigned region');
+          await session.send('Emulation.setFocusEmulationEnabled', {enabled: true});
+          try { return await (CODE)(page); }
+          finally { await session.send('Emulation.setFocusEmulationEnabled', {enabled: false}); }
+        } finally { await session.detach(); }
+      }
+      throw new Error('Configured agent tab is missing; run startup setup');
+    }""".replace('BINDING', json.dumps(binding)).replace('CODE', code)
+    return client('call', ['browser_run_code_unsafe', {'code': wrapper}])
+
+def start_chrome(argv):
+    if any(x.startswith('--') and x != '--prepare-only' for x in argv):
+        raise Error('Unsupported startup option; use the native Chrome action for private browsing')
+    config = load_config()
+    if '--prepare-only' not in argv:
+        subprocess.Popen([config['chrome_exe'], '--user-data-dir=' + config['profile'],
+            '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=' + str(endpoint(config['cdp_endpoint'], 'CDP')),
+            '--no-first-run', '--no-default-browser-check', '--no-startup-window'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+    for attempt in range(40):
+        try:
+            identity = chrome_identity(config)
+            break
+        except Error:
+            if attempt == 39: raise
+            time.sleep(0.25)
+    subprocess.run(['systemctl', '--user', 'start', 'browserctl-controller.service'], check=True)
+    client('task_begin', ['chrome-startup'], True)
+    try:
+        target = Path(os.getenv('XDG_CONFIG_HOME', Path.home()/'.config')) / 'browserctl/agent-window.json'
+        previous = read_json(target, 'agent window binding') if target.exists() else None
+        if previous and (previous['pid'], previous['start']) != (identity['pid'], identity['start']):
+            previous = None
+        code = '''async(page)=>{
+          const {region,human,prepareOnly,previous}=SETUP;
+          const session=await page.context().browser().newBrowserCDPSession();
+          try {
+            const targets=(await session.send('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
+            const windows=new Map(), matches=[];
+            let bound;
+            for(const t of targets){
+              let w;
+              try {w=await session.send('Browser.getWindowForTarget',{targetId:t.targetId});}
+              catch(e){if(String(e).includes('Browser window not found'))continue;throw e;}
+              const item={targetId:t.targetId,windowId:w.windowId,bounds:w.bounds};
+              windows.set(w.windowId,item);
+              if(previous && t.targetId===previous.targetId && w.windowId===previous.windowId)bound=item;
+              if(w.bounds.windowState==='normal' && Object.keys(region).every(k=>Math.abs(w.bounds[k]-region[k])<8))
+                matches.push(item);
+            }
+            if(new Set(matches.map(x=>x.windowId)).size>1)throw new Error('Multiple windows occupy the agent region');
+            if(windows.size>2)throw new Error('Expected only human and agent Chrome windows');
+            if(bound && !matches.some(t=>t.targetId===bound.targetId))throw new Error('Recorded agent window moved; restore its configured bounds');
+            let agent=bound || matches[0];
+            if(!agent){
+              if(windows.size>=2)throw new Error('Two Chrome windows exist but agent identification failed; no window was created');
+              const {targetId}=await session.send('Target.createTarget',{url:'about:blank',newWindow:true,background:true,focus:false,...region});
+              const w=await session.send('Browser.getWindowForTarget',{targetId});
+              agent={targetId,windowId:w.windowId};
+            }
+            const personal=[...windows.values()].find(w=>w.windowId!==agent.windowId);
+            if(!prepareOnly){
+              if(personal)await session.send('Target.activateTarget',{targetId:personal.targetId});
+              else await session.send('Target.createTarget',{url:'https://mail.google.com/mail/u/0/',newWindow:true,background:false,focus:true,...human});
+            }
+            return agent;
+          } finally {await session.detach();}
+        }'''
+        code = code.replace('SETUP', json.dumps({'prepareOnly': '--prepare-only' in argv, 'previous': previous,
+            'region': config['agent_region'], 'human': config['human_region']}))
+        result = client('call', ['browser_run_code_unsafe', {'code': code}], True)
+        text = next(c['text'] for c in result['content'] if c.get('text', '').startswith('### Result\n'))
+        binding = json.loads(text.split('### Result\n', 1)[1].split('\n### ', 1)[0])
+        if config['hostname'] == 'laptop':
+            import gi
+            gi.require_version('Wnck', '3.0')
+            from gi.repository import Wnck
+            screen = Wnck.Screen.get_default()
+            region = config['agent_region']
+            for attempt in range(40):
+                screen.force_update()
+                windows = [w for w in screen.get_windows() if w.get_pid() == identity['pid'] and
+                           tuple(w.get_client_window_geometry()) == tuple(region[k] for k in ('left', 'top', 'width', 'height'))]
+                if len(windows) == 1:
+                    break
+                time.sleep(.05)
+            require(len(windows) == 1, 'Cannot identify the native agent window for desktop placement')
+            windows[0].move_to_workspace(screen.get_workspace(1))
+        binding.update(pid=identity['pid'], start=identity['start'], region=config['agent_region'])
+        temporary = target.with_suffix('.tmp')
+        temporary.write_text(json.dumps(binding, indent=2)+'\n'); temporary.chmod(0o600)
+        temporary.replace(target)
+        if argv and '--prepare-only' not in argv:
+            subprocess.Popen([config['chrome_exe'], '--user-data-dir='+config['profile'], *argv],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(json.dumps({'ready': True, **binding}))
+    finally:
+        status = client('status', [], True)
+        if status['owner'] == 'chrome-startup' and status['state'] == 'READY':
+            client('task_end', [], True)
 
 def parse_cli(argv):
+    if argv and argv[0] == 'start':
+        start_chrome(argv[1:])
+        return 0
+    if argv == ['agent']:
+        return agent_cli(sys.stdin.read())
     if argv == ['daemon']:
         Daemon().serve()
         return 0
@@ -865,9 +895,6 @@ def parse_cli(argv):
         return 0
     if tuple(argv) in SIMPLE_CLI:
         return client(*SIMPLE_CLI[tuple(argv)])
-    tab_result = tab_cli(argv)
-    if tab_result is not None:
-        return tab_result
     if len(argv) == 3 and argv[:2] == ['task', 'begin']:
         return client('task_begin', [argv[2]])
     if len(argv) == 3 and argv[0] == 'call':
@@ -877,13 +904,13 @@ def parse_cli(argv):
         return client('call', [argv[1], arguments])
     fail(
         'usage: browserctl.py doctor|status|task begin OWNER|task recover|'
-        'task end|tab new|tab list|tab select INDEX|tab close INDEX|tools|'
-        'call TOOL JSON|result')
+        'task end|start [--prepare-only|URL...]|tools|'
+        'agent < FUNCTION.js|call TOOL JSON|result')
 if __name__ == '__main__':
     try:
         raise SystemExit(parse_cli(sys.argv[1:]))
     except KeyboardInterrupt:
         raise SystemExit(0)
-    except Error as exc:
+    except (Error, subprocess.CalledProcessError) as exc:
         print(f'browserctl: {exc}', file=sys.stderr)
         raise SystemExit(1)

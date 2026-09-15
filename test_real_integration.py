@@ -2,6 +2,7 @@
 """Disposable exact-MCP integration; never contacts a live browser profile."""
 
 import json
+import ast
 import os
 from pathlib import Path
 import signal
@@ -11,14 +12,14 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import browserctl
 
 ROOT = Path(__file__).parent
 CTL = ROOT / "browserctl.py"
 UNIT = ROOT / "browserctl-controller.service"
-CACHE = Path(os.getenv(
-    "XDG_CACHE_HOME", Path.home() / ".cache")) / "browserctl/npm"
+CACHE = Path(os.getenv("npm_config_cache", Path.home() / ".npm"))
 
 
 def free_port():
@@ -28,13 +29,13 @@ def free_port():
 
 
 def dependencies():
-    edge = next(filter(None, (shutil.which(name) for name in (
-        "microsoft-edge", "microsoft-edge-stable"))), None)
+    chrome = next(filter(None, (shutil.which(name) for name in (
+        "google-chrome", "google-chrome-stable"))), None)
     npx = shutil.which("npx")
     missing = [
-        label for label, path in (("Microsoft Edge", edge), ("npx", npx))
+        label for label, path in (("Google Chrome", chrome), ("npx", npx))
         if path is None]
-    return edge, npx, missing
+    return chrome, npx, missing
 
 
 def processes_with(argument):
@@ -53,15 +54,15 @@ def processes_with(argument):
 
 
 class RealIntegration(unittest.TestCase):
-    def test_disposable_edge_and_exact_cached_mcp(self):
-        edge_command, npx_command, missing = dependencies()
+    def test_disposable_chrome_and_exact_cached_mcp(self):
+        chrome_command, npx_command, missing = dependencies()
         if missing:
             self.fail(
                 "qualification dependencies missing from PATH: " +
                 ", ".join(missing))
-        edge_launcher = Path(edge_command).absolute()
+        chrome_launcher = Path(chrome_command).absolute()
         npx = Path(npx_command).absolute()
-        edge = daemon = notify = None
+        chrome = daemon = notify = None
         mcp_marker = None
         with tempfile.TemporaryDirectory(prefix="browserctl-real-") as name:
             base = Path(name)
@@ -98,8 +99,8 @@ class RealIntegration(unittest.TestCase):
                 "npm_config_cache": str(CACHE), "npm_config_offline": "true",
             }
             try:
-                edge = subprocess.Popen([
-                    edge_launcher, "--headless=new", "--no-first-run",
+                chrome = subprocess.Popen([
+                    chrome_launcher, "--headless=new", "--no-first-run",
                     "--no-default-browser-check", "--disable-gpu", "--no-sandbox",
                     f"--remote-debugging-port={cdp}",
                     f"--user-data-dir={human}", "about:blank"],
@@ -108,8 +109,8 @@ class RealIntegration(unittest.TestCase):
                 deadline = time.monotonic() + 15
                 lock = human / "SingletonLock"
                 while time.monotonic() < deadline and not lock.is_symlink():
-                    if edge.poll() is not None:
-                        self.fail(f"temporary Edge failed: {edge.stderr.read()}")
+                    if chrome.poll() is not None:
+                        self.fail(f"temporary Chrome failed: {chrome.stderr.read()}")
                     time.sleep(.05)
                 self.assertTrue(lock.is_symlink())
                 while time.monotonic() < deadline:
@@ -118,21 +119,18 @@ class RealIntegration(unittest.TestCase):
                             break
                     time.sleep(.05)
                 else:
-                    self.fail("temporary Edge CDP listener did not become ready")
+                    self.fail("temporary Chrome CDP listener did not become ready")
                 lock_pid = int(os.readlink(lock).rsplit("-", 1)[1])
-                edge_exe = os.readlink(f"/proc/{lock_pid}/exe")
+                chrome_exe = os.readlink(f"/proc/{lock_pid}/exe")
                 host = {
                     "schema_version": 1, "hostname": socket.gethostname(),
                     "user": subprocess.check_output(
                         ["id", "-un"], text=True).strip(),
-                    "human": {
-                        "edge_exe": edge_exe, "profile": str(human),
-                        "cdp_endpoint": f"http://127.0.0.1:{cdp}"},
-                    "agent": {
-                        "edge_exe": edge_exe, "profile": str(agent),
-                        "cdp_endpoint": f"http://127.0.0.1:{unused}"},
-                    "mcp_command": [
-                        str(npx), "--yes", "@playwright/mcp@0.0.78"],
+                    "chrome_exe": chrome_exe, "profile": str(human),
+                    "cdp_endpoint": f"http://127.0.0.1:{cdp}",
+                    "npx": str(npx),
+                    "agent_region": {"left": 0, "top": 0, "width": 800, "height": 600},
+                    "human_region": {"left": 0, "top": 0, "width": 800, "height": 600},
                 }
                 host_path = config / "browserctl/host.json"
                 host_path.write_text(json.dumps(host))
@@ -164,16 +162,84 @@ class RealIntegration(unittest.TestCase):
                     processes_with(mcp_marker), "warm MCP process not found")
                 for args in (
                     ["task", "begin", "disposable integration"],
-                    ["tab", "new"], ["tab", "list"],
-                    ["tab", "select", "1"],
+                    ["call", "browser_tabs", '{"action": "new"}'], ["call", "browser_tabs", '{"action": "list"}'],
+                    ["call", "browser_tabs", '{"action": "select", "index": 1}'],
                     ["call", "browser_snapshot", "{}"],
-                    ["tab", "close", "1"], ["task", "end"]):
+                    ["call", "browser_tabs", '{"action": "close", "index": 1}'], ["task", "end"]):
                     result = subprocess.run(
                         [CTL, *args], env=env, text=True,
                         capture_output=True, timeout=30)
                     self.assertEqual(
                         result.returncode, 0,
                         f"{args}: {result.stdout} {result.stderr}")
+                def run(*args, code=None, ok=True):
+                    result = subprocess.run([CTL, *args], env=env, text=True,
+                        input=code, capture_output=True, timeout=30)
+                    self.assertEqual(result.returncode, 0 if ok else 1, result.stderr)
+                    return result
+                run("task", "begin", "agent identity verification")
+                result = run("call", "browser_run_code_unsafe", json.dumps({"code": """async(page)=>{
+                  const session=await page.context().newCDPSession(page);
+                  try {
+                    const {targetInfo}=await session.send('Target.getTargetInfo');
+                    const {windowId,bounds}=await session.send('Browser.getWindowForTarget',{targetId:targetInfo.targetId});
+                    return {targetId:targetInfo.targetId,windowId,region:bounds};
+                  } finally {await session.detach();}
+                }"""}))
+                content=json.loads(result.stdout)['content']
+                text=next(c['text'] for c in content if c.get('text','').startswith('### Result\n'))
+                binding=json.loads(text.split('### Result\n',1)[1].split('\n### ',1)[0])
+                with mock.patch.dict(os.environ,env):
+                    identity=browserctl.chrome_identity(host)
+                binding.update(pid=identity['pid'],start=identity['start'])
+                binding_path=config/'browserctl/agent-window.json'
+                binding_path.write_text(json.dumps(binding))
+                valid=run('agent',code='async(page)=>({title:await page.title()})')
+                self.assertIn('title',valid.stdout)
+                for key,wrong,expected in [('windowId',-1,'moved to another window'),
+                        ('targetId','missing-target','Configured agent tab is missing'),
+                        ('start','wrong-start','another browser'),
+                        ('region',{'left':10000,'top':0,'width':10,'height':10},'outside its assigned region')]:
+                    binding_path.write_text(json.dumps({**binding,key:wrong}))
+                    failed=run('agent',code='async()=>{throw new Error("USER_CODE_EXECUTED")}',ok=False)
+                    self.assertIn(expected,failed.stderr)
+                binding_path.write_text(json.dumps(binding))
+                # Exercise the actual startup JavaScript against two disposable Chrome windows.
+                tree=ast.parse(CTL.read_text())
+                startup=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='start_chrome')
+                script=next(n.value for n in ast.walk(startup) if isinstance(n,ast.Constant) and
+                            isinstance(n.value,str) and 'const {region,human,prepareOnly,previous}' in n.value)
+                def raw(code,ok=True):
+                    return run('call','browser_run_code_unsafe',json.dumps({'code':code}),ok=ok)
+                raw("""async(page)=>{
+                  const s=await page.context().browser().newBrowserCDPSession();
+                  try {return await s.send('Target.createTarget',{url:'about:blank',newWindow:true,left:850,top:0,width:800,height:600});}
+                  finally {await s.detach();}
+                }""")
+                setup={'region':{k:binding['region'][k] for k in ('left','top','width','height')},
+                       'human':{'left':850,'top':0,'width':800,'height':600},
+                       'prepareOnly':True,'previous':binding}
+                count="""async(page)=>{
+                  const s=await page.context().browser().newBrowserCDPSession();
+                  try {
+                    const windows=new Set();
+                    for(const t of (await s.send('Target.getTargets')).targetInfos.filter(t=>t.type==='page'))
+                      windows.add((await s.send('Browser.getWindowForTarget',{targetId:t.targetId})).windowId);
+                    return {windowCount:windows.size};
+                  }finally{await s.detach();}
+                }"""
+                for prepare in [True,False,True]:
+                    raw(script.replace('SETUP',json.dumps({**setup,'prepareOnly':prepare})))
+                    self.assertIn('"windowCount":2',json.loads(raw(count).stdout)['content'][0]['text'])
+                missing={**setup,'previous':None,'region':{**setup['region'],'left':9000}}
+                failed=raw(script.replace('SETUP',json.dumps(missing)),ok=False)
+                self.assertIn('no window was created',failed.stderr)
+                self.assertIn('"windowCount":2',json.loads(raw(count).stdout)['content'][0]['text'])
+                moved={**setup,'region':{**setup['region'],'left':9000}}
+                failed=raw(script.replace('SETUP',json.dumps(moved)),ok=False)
+                self.assertIn('Recorded agent window moved',failed.stderr)
+                self.assertIn('"windowCount":2',json.loads(raw(count).stdout)['content'][0]['text'])
+                run('task','end')
             finally:
                 if daemon and daemon.poll() is None:
                     daemon.terminate()
@@ -188,15 +254,15 @@ class RealIntegration(unittest.TestCase):
                 if daemon:
                     daemon.stdout.close()
                     daemon.stderr.close()
-                if edge and edge.poll() is None:
-                    os.killpg(edge.pid, signal.SIGTERM)
+                if chrome and chrome.poll() is None:
+                    os.killpg(chrome.pid, signal.SIGTERM)
                     try:
-                        edge.wait(5)
+                        chrome.wait(5)
                     except subprocess.TimeoutExpired:
-                        os.killpg(edge.pid, signal.SIGKILL)
-                        edge.wait(5)
-                if edge:
-                    edge.stderr.close()
+                        os.killpg(chrome.pid, signal.SIGKILL)
+                        chrome.wait(5)
+                if chrome:
+                    chrome.stderr.close()
                 if notify:
                     notify.close()
 

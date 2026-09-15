@@ -120,7 +120,7 @@ def free_port():
 class BrowserctlTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="browserctl-test-")
-        self.edge, self.daemon, self.notify = [], None, None
+        self.chrome, self.daemon, self.notify = [], None, None
         self.addCleanup(self.cleanup_all)
         self.base = Path(self.temp.name)
         self.config = self.base / "config"
@@ -165,18 +165,16 @@ class BrowserctlTests(unittest.TestCase):
         self.notify.bind(str(self.notify_path))
         self.notify.settimeout(5)
         self.ports = [free_port(), free_port()]
-        self.start_edge(self.human, self.ports[0])
-        self.start_edge(self.agent, self.ports[1])
+        self.start_chrome(self.human, self.ports[0])
         data = {
             "schema_version": 1, "hostname": socket.gethostname(),
             "user": subprocess.check_output(["id", "-un"], text=True).strip(),
-            "human": {"edge_exe": os.path.realpath(sys.executable),
-                      "profile": str(self.human),
-                      "cdp_endpoint": f"http://127.0.0.1:{self.ports[0]}"},
-            "agent": {"edge_exe": os.path.realpath(sys.executable),
-                      "profile": str(self.agent),
-                      "cdp_endpoint": f"http://127.0.0.1:{self.ports[1]}"},
-            "mcp_command": [str(fake_npx), "--yes", "@playwright/mcp@0.0.78"],
+            "chrome_exe": os.path.realpath(sys.executable),
+            "profile": str(self.human),
+            "cdp_endpoint": f"http://127.0.0.1:{self.ports[0]}",
+            "npx": str(fake_npx),
+            "agent_region": {"left": 500, "top": 0, "width": 500, "height": 700},
+            "human_region": {"left": 0, "top": 0, "width": 500, "height": 700},
         }
         host = self.config / "browserctl/host.json"
         host.write_text(json.dumps(data))
@@ -193,14 +191,14 @@ class BrowserctlTests(unittest.TestCase):
 
     def cleanup_all(self):
         self.stop_daemon()
-        for process in getattr(self, "edge", []):
+        for process in getattr(self, "chrome", []):
             self.stop_process(process)
         if self.notify:
             self.notify.close()
         self.temp.cleanup()
 
-    def start_edge(self, profile, port):
-        ready = self.base / f"edge-{port}.ready"
+    def start_chrome(self, profile, port):
+        ready = self.base / f"chrome-{port}.ready"
         process = subprocess.Popen([
             sys.executable, "-c", EDGE, str(profile), str(port), str(ready),
             f"--remote-debugging-port={port}", f"--user-data-dir={profile}"],
@@ -209,12 +207,12 @@ class BrowserctlTests(unittest.TestCase):
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline and not ready.exists():
             if process.poll() is not None:
-                self.fail(f"fake Edge failed: {process.stderr.read()}")
+                self.fail(f"fake Chrome failed: {process.stderr.read()}")
             time.sleep(.01)
         self.assertTrue(ready.exists())
         (profile / "SingletonLock").symlink_to(
             f"{socket.gethostname()}-{process.pid}")
-        self.edge.append(process)
+        self.chrome.append(process)
 
     def stop_process(self, process):
         if process.poll() is None:
@@ -287,28 +285,43 @@ class BrowserctlTests(unittest.TestCase):
     def calls(self, name):
         return [item for item in self.read_events() if item.get("name") == name]
 
-    def test_two_profiles_and_doctor_select_only_policy_pid(self):
-        result = json.loads(self.run_ctl("doctor").stdout)
-        self.assertEqual(result["edge_pid"], self.edge[0].pid)
-        self.display.write_text("agent")
-        active = json.loads(self.run_ctl("doctor").stdout)
-        self.assertEqual(active["edge_pid"], self.edge[1].pid)
+    def test_single_profile_does_not_require_a_display(self):
+        (self.bin / 'xrandr').write_text('#!/bin/sh\nexit 1\n')
+        result = json.loads(self.run_ctl('doctor').stdout)
+        self.assertEqual(result['chrome_pid'], self.chrome[0].pid)
 
-    def test_selected_edge_tree_must_own_configured_listener(self):
+    def test_old_configuration_is_rejected(self):
+        host = self.config / 'browserctl/host.json'
+        config = json.loads(host.read_text())
+        config['human'] = {}
+        host.write_text(json.dumps(config))
+        failed = self.run_ctl('doctor', check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn('unsupported schema', failed.stderr)
+
+    def test_endpoint_is_ipv4_loopback_only(self):
+        self.assertEqual(browserctl.endpoint('http://127.0.0.1:9226', 'CDP'), 9226)
+        for url in ['http://[::1]:9226', 'http://localhost:9226',
+                    'http://127.0.0.1:0', 'http://127.0.0.1:65536',
+                    'http://127.0.0.1:09226', 'http://127.0.0.1:9226/path']:
+            with self.subTest(url=url), self.assertRaises(browserctl.Error):
+                browserctl.endpoint(url, 'CDP')
+
+    def test_selected_chrome_process_must_own_configured_listener(self):
         self.stop_daemon()
-        selected = self.edge.pop(0)
+        selected = self.chrome.pop(0)
         self.stop_process(selected)
         (self.human / "SingletonLock").unlink()
-        (self.base / f"edge-{self.ports[0]}.ready").unlink(missing_ok=True)
+        (self.base / f"chrome-{self.ports[0]}.ready").unlink(missing_ok=True)
         unrelated = self.base / "unrelated"
         unrelated.mkdir()
-        self.start_edge(unrelated, self.ports[0])
+        self.start_chrome(unrelated, self.ports[0])
         selected = subprocess.Popen([
             sys.executable, "-c", "import time; time.sleep(20)",
             f"--remote-debugging-port={self.ports[0]}",
             f"--user-data-dir={self.human}"],
             stderr=subprocess.PIPE, text=True, start_new_session=True)
-        self.edge.append(selected)
+        self.chrome.append(selected)
         (self.human / "SingletonLock").symlink_to(
             f"{socket.gethostname()}-{selected.pid}")
         failed = self.run_ctl(
@@ -330,12 +343,12 @@ class BrowserctlTests(unittest.TestCase):
     def test_failed_new_can_reconcile_continue_and_end(self):
         self.run_ctl("task", "begin", "reconcile")
         self.mode.write_text("fail_new_after_create")
-        failed = self.run_ctl("tab", "new", check=False)
+        failed = self.run_ctl("call", "browser_tabs", '{"action": "new"}', check=False)
         self.assertEqual(failed.returncode, 1)
         self.assertEqual(self.status()["state"], "READY")
         self.mode.write_text("healthy")
-        self.assertIn("list tab 1", self.run_ctl("tab", "list").stdout)
-        self.run_ctl("tab", "select", "1")
+        self.assertIn("list tab 1", self.run_ctl("call", "browser_tabs", '{"action": "list"}').stdout)
+        self.run_ctl("call", "browser_tabs", '{"action": "select", "index": 1}')
         self.run_ctl("call", "browser_snapshot", "{}")
         self.run_ctl("call", "browser_navigate", '{"url":"https://example.com"}')
         self.run_ctl("task", "end")
@@ -347,9 +360,9 @@ class BrowserctlTests(unittest.TestCase):
         self.run_ctl("call", "browser_click", '{"target":"e999"}')
         self.mode.write_text("empty_snapshot")
         self.run_ctl("call", "browser_snapshot", "{}")
-        self.run_ctl("tab", "list")
-        self.run_ctl("tab", "new")
-        self.run_ctl("tab", "close", "1")
+        self.run_ctl("call", "browser_tabs", '{"action": "list"}')
+        self.run_ctl("call", "browser_tabs", '{"action": "new"}')
+        self.run_ctl("call", "browser_tabs", '{"action": "close", "index": 1}')
         self.run_ctl("task", "end")
 
     def test_raw_tools_and_run_code_allowed_but_browser_close_blocked(self):
@@ -396,7 +409,7 @@ class BrowserctlTests(unittest.TestCase):
     def test_task_end_from_ready_after_begin_success_and_tool_error(self):
         paths = (
             lambda: None,
-            lambda: self.run_ctl("tab", "list"),
+            lambda: self.run_ctl("call", "browser_tabs", '{"action": "list"}'),
             lambda: self.run_ctl("call", "browser_navigate", "{}",
                                  check=False))
         for index, action in enumerate(paths):
@@ -410,23 +423,10 @@ class BrowserctlTests(unittest.TestCase):
                 self.assertEqual(self.status()["state"], "IDLE")
                 self.mode.write_text("healthy")
 
-    def test_legacy_ready_new_migrates_once_and_restart_rebinds(self):
-        self.run_ctl("task", "begin", "legacy-ready")
+    def test_ready_restart_rebinds(self):
+        self.run_ctl("task", "begin", "restart-ready")
         old_generation = self.task()["generation"]
         self.stop_daemon()
-        path = self.state / "browserctl/task.json"
-        legacy = self.task()
-        legacy.update({"phase": "NEW", "snapshot": False})
-        path.write_text(json.dumps(legacy))
-        path.chmod(0o600)
-        with mock.patch.dict(os.environ, self.env):
-            migrated = browserctl.read_task(False)
-            first = path.read_bytes()
-            browserctl.read_task(False)
-        self.assertEqual(path.read_bytes(), first)
-        self.assertEqual(migrated["owner"], "legacy-ready")
-        self.assertEqual(migrated["generation"], old_generation)
-        self.assertEqual(set(migrated), browserctl.TASK_KEYS)
         self.start_daemon()
         self.assertEqual(self.status()["state"], "READY")
         self.assertNotEqual(self.task()["generation"], old_generation)
@@ -445,7 +445,7 @@ class BrowserctlTests(unittest.TestCase):
         path.write_text(json.dumps(legacy))
         before = path.read_bytes()
         with mock.patch.dict(os.environ, self.env), \
-             self.assertRaisesRegex(browserctl.Error, "legacy result"):
+             self.assertRaisesRegex(browserctl.Error, "malformed or unsupported"):
             browserctl.read_task(False)
         self.assertEqual(path.read_bytes(), before)
 
@@ -467,15 +467,19 @@ class BrowserctlTests(unittest.TestCase):
                     self.run_ctl("task", "recover")
                     self.assertEqual(self.status()["state"], "READY")
                     self.run_ctl("call", "browser_snapshot", "{}")
-                    self.run_ctl("tab", "list")
+                    self.run_ctl("call", "browser_tabs", '{"action": "list"}')
                 self.run_ctl("task", "end")
                 self.assertEqual(self.status()["state"], "IDLE")
 
     def test_identity_drift_quarantines_without_dispatch(self):
         self.run_ctl("task", "begin", "drift")
         before = len(self.calls("browser_tabs"))
-        self.display.write_text("agent")
-        failed = self.run_ctl("tab", "new", check=False)
+        selected = self.chrome.pop(0)
+        self.stop_process(selected)
+        (self.human / "SingletonLock").unlink()
+        (self.base / f"chrome-{self.ports[0]}.ready").unlink(missing_ok=True)
+        self.start_chrome(self.human, self.ports[0])
+        failed = self.run_ctl("call", "browser_tabs", '{"action": "new"}', check=False)
         self.assertIn("identity", failed.stderr)
         self.assertEqual(self.status()["state"], "RECOVERY")
         self.assertEqual(len(self.calls("browser_tabs")), before)
@@ -582,18 +586,13 @@ class BrowserctlTests(unittest.TestCase):
         self.assertEqual(len(self.calls("browser_navigate")), 1)
         self.stop_daemon()
         path = self.state / "browserctl/task.json"
-        legacy = self.task()
-        legacy.update({"phase": "ARMED", "snapshot": False})
-        legacy["receipt"].update({"success": True, "post": {}})
-        path.write_text(json.dumps(legacy))
-        path.chmod(0o600)
         self.start_daemon()
         self.run_ctl("result")
         self.assertEqual(self.status()["state"], "READY")
         self.assertEqual(len(self.calls("browser_navigate")), 1)
         self.assertEqual(set(self.task()), browserctl.TASK_KEYS)
         self.run_ctl("call", "browser_snapshot", "{}")
-        self.run_ctl("tab", "new")
+        self.run_ctl("call", "browser_tabs", '{"action": "new"}')
         self.run_ctl("task", "end")
 
     def test_initial_request_ack_and_client_response_stalls_are_bounded(self):
