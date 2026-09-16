@@ -1,9 +1,9 @@
 #!/usr/bin/python3
 """Small controller for one warm Playwright MCP browser session."""
-import hashlib, json, math, os
+import base64, hashlib, itertools, json, math, os
 from pathlib import Path
 import pwd, re, secrets, signal, socket, subprocess, sys, tempfile, time
-import urllib.error, urllib.request
+import urllib.error, urllib.parse, urllib.request
 SCHEMA, PROTOCOL = 1, '2025-03-26'
 MAX, HTTP_TIMEOUT, IO_TIMEOUT = 16 * 1024 * 1024, 90, 2
 BUILD = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
@@ -196,6 +196,48 @@ def chrome_identity(config):
             'selected Chrome process does not own the CDP listener')
     return {'pid': pid, 'start': start, 'exe': exe,
             'profile': config['profile'], 'cdp': config['cdp_endpoint']}
+
+def preloaded_tabs(config):
+    """Return URLs of tabs whose main frame was swapped in from Chrome preloading.
+
+    MCP 0.0.78 cannot attach to such a tab after reconnecting, so every tool
+    response waits for its title until the call times out.
+    """
+    port = endpoint(config['cdp_endpoint'], 'CDP')
+    with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/version', timeout=HTTP_TIMEOUT) as response:
+        path = urllib.parse.urlsplit(json.load(response)['webSocketDebuggerUrl']).path
+    key = base64.b64encode(secrets.token_bytes(16)).decode()
+    with socket.create_connection(('127.0.0.1', port), HTTP_TIMEOUT) as stream, stream.makefile('rb') as reader:
+        stream.sendall(f'GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                       f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n'.encode())
+        require(reader.readline().split()[1:2] == [b'101'], 'CDP websocket upgrade failed')
+        while reader.readline() not in (b'\r\n', b''): pass
+        ids = itertools.count(1)
+        def send(method, params=None, session=None):
+            identifier, mask = next(ids), secrets.token_bytes(4)
+            body = json.dumps({'id': identifier, 'method': method, 'params': params or {},
+                               **({'sessionId': session} if session else {})}).encode()
+            size = bytes([128 | len(body)]) if len(body) < 126 else bytes([254]) + len(body).to_bytes(2, 'big')
+            stream.sendall(bytes([129]) + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(body)))
+            while True:
+                size = reader.read(2)[1] & 127
+                if size > 125: size = int.from_bytes(reader.read(2 if size == 126 else 8), 'big')
+                message = json.loads(reader.read(size))
+                if message.get('id') == identifier:
+                    require('result' in message, f'CDP {method} failed: {message}')
+                    return message['result']
+        stale = []
+        for target in send('Target.getTargets')['targetInfos']:
+            if target['type'] == 'page':
+                session = send('Target.attachToTarget', {'targetId': target['targetId'], 'flatten': True})['sessionId']
+                if send('Page.getFrameTree', session=session)['frameTree']['frame']['id'] != target['targetId']:
+                    stale.append(target['url'])
+                send('Target.detachFromTarget', {'sessionId': session})
+        return stale
+
+def require_no_preloaded_tabs(config):
+    stale = preloaded_tabs(config)
+    require(not stale, 'preloaded Chrome tabs hang Playwright; close them or restart Chrome: ' + ' '.join(stale))
 
 def valid_receipt(receipt):
     keys = {'id', 'request_id', 'stdout', 'stderr', 'exit_code'}
@@ -766,6 +808,7 @@ def agent_cli(code):
                         'browserctl/agent-window.json', 'agent window binding')
     require(binding['pid'] == identity['pid'] and binding['start'] == identity['start'],
             'agent window binding belongs to another browser; run startup setup')
+    require_no_preloaded_tabs(config)
     require(code.strip(), 'agent expects an async function on stdin')
     wrapper = """async (rootPage) => {
       const binding = BINDING;
@@ -806,6 +849,7 @@ def start_chrome(argv):
         except Error:
             if attempt == 39: raise
             time.sleep(0.25)
+    require_no_preloaded_tabs(config)
     subprocess.run(['systemctl', '--user', 'start', 'browserctl-controller.service'], check=True)
     client('task_begin', ['chrome-startup'], True)
     try:

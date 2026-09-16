@@ -52,6 +52,8 @@ JS
 
 Every dispatch is durably `RUNNING` before transmission and `RESULT` before output. Acknowledgement returns it to `READY`. After a disconnect, `result` retrieves saved output without replay. An ordinary tool error exits 1 and returns to `READY`; inspect actual page state before retrying because the action may have occurred. If state is `RECOVERY`, the owning agent inspects what happened, restarts `browserctl-controller.service`, and uses `task recover` or `task end`. Never replay uncertain actions automatically.
 
+Keep Chrome's "Preload pages" setting off. A tab shown from a preloaded page gets a new main frame that MCP `0.0.78` cannot reattach to, so later calls would time out after 90 s; `start` and `agent` instead fail immediately with those tab URLs. Close the tabs or restart Chrome.
+
 ## Verify
 
 ```bash

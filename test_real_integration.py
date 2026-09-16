@@ -3,6 +3,7 @@
 
 import json
 import ast
+import http.server
 import os
 from pathlib import Path
 import signal
@@ -10,8 +11,10 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
+import urllib.request
 from unittest import mock
 
 import browserctl
@@ -135,6 +138,32 @@ class RealIntegration(unittest.TestCase):
                 host_path = config / "browserctl/host.json"
                 host_path.write_text(json.dumps(host))
                 host_path.chmod(0o600)
+                # Activating a prerendered page swaps the tab's main frame, which MCP cannot reattach to.
+                class Site(http.server.BaseHTTPRequestHandler):
+                    def log_message(self, *_): pass
+                    def do_GET(self):
+                        self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
+                        self.wfile.write(b"" if self.path == "/b" else
+                            b'<script type="speculationrules">{"prerender": [{"source": "list", "urls": ["/b"]}]}</script>'
+                            b'<script>setTimeout(() => location.href = "/b", 1000)</script>')
+                site = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
+                threading.Thread(target=site.serve_forever, daemon=True).start()
+                try:
+                    devtools, page = f"http://127.0.0.1:{cdp}/json", f"http://127.0.0.1:{site.server_address[1]}"
+                    self.assertEqual(browserctl.preloaded_tabs(host), [])
+                    with urllib.request.urlopen(urllib.request.Request(f"{devtools}/new?{page}/a", method="PUT")) as response:
+                        tab = json.load(response)["id"]
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        with urllib.request.urlopen(f"{devtools}/list") as response:
+                            if {"id": tab, "url": f"{page}/b"} in [{"id": t["id"], "url": t["url"]} for t in json.load(response)]:
+                                break
+                        time.sleep(.05)
+                    self.assertEqual(browserctl.preloaded_tabs(host), [f"{page}/b"])
+                    with urllib.request.urlopen(f"{devtools}/close/{tab}"): pass
+                finally:
+                    site.shutdown()
+                    site.server_close()
                 daemon = subprocess.Popen(
                     [CTL, "daemon"], env=env, text=True,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
