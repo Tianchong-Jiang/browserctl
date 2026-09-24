@@ -1,0 +1,6 @@
+{
+  "uuid": "no-app-workspace-switch@tianchongj",
+  "name": "No App Workspace Switch",
+  "description": "Only GNOME Shell user controls may switch workspaces; app-requested switches are undone.",
+  "shell-version": ["46"]
+}

@@ -34,6 +34,8 @@ Supported hosts are the laptop and Oak on Linux. CDP must use `http://127.0.0.1:
 
 The controller pins MCP `0.0.78` and loads `background-page.cjs` to suppress Playwright's window-raising call. It checks the executable, process owner, PID start time, profile, and CDP listener before dispatch.
 
+On the laptop, `gnome-extension/no-app-workspace-switch@tianchongj` keeps apps, including Chrome, from switching workspaces. Mutter switches whenever a client requests `_NET_ACTIVE_WINDOW` for a window on another workspace or `_NET_CURRENT_DESKTOP`; the extension immediately undoes switches not made through GNOME Shell controls (overview, Alt+Tab, dock, keybindings, notifications) and logs `blocked workspace switch` to the journal. Install it by symlinking the directory into `~/.local/share/gnome-shell/extensions/`, logging in again, then running `gsettings set org.gnome.shell disable-user-extensions false` and `gnome-extensions enable no-app-workspace-switch@tianchongj`.
+
 ## Use
 
 ```bash
