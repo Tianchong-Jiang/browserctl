@@ -484,6 +484,15 @@ class BrowserctlTests(unittest.TestCase):
         self.assertEqual(self.status()["state"], "RECOVERY")
         self.assertEqual(len(self.calls("browser_tabs")), before)
 
+    def test_same_attachment_is_retained_across_tasks(self):
+        initial = [e for e in self.read_events() if e['method'] == 'initialize']
+        for index in range(3):
+            self.run_ctl('task', 'begin', f'persistent-{index}')
+            result = self.run_ctl('call', 'browser_tabs', '{"action":"new"}')
+            self.assertIn(f'tab {index + 1}', result.stdout)
+            self.run_ctl('task', 'end')
+        self.assertEqual([e for e in self.read_events() if e['method'] == 'initialize'], initial)
+
     def test_mcp_session_syntax(self):
         self.assertTrue(browserctl.valid_session("abc-123"))
         for bad in ("", "bad session", "x\n", "x" * 257):

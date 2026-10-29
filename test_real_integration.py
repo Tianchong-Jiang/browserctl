@@ -105,6 +105,7 @@ class RealIntegration(unittest.TestCase):
                 chrome = subprocess.Popen([
                     chrome_launcher, "--headless=new", "--no-first-run",
                     "--no-default-browser-check", "--disable-gpu", "--no-sandbox",
+                    "--disable-features=Prerender2MemoryControls",
                     f"--remote-debugging-port={cdp}",
                     f"--user-data-dir={human}", "about:blank"],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -139,18 +140,28 @@ class RealIntegration(unittest.TestCase):
                 host_path.write_text(json.dumps(host))
                 host_path.chmod(0o600)
                 # Activating a prerendered page swaps the tab's main frame, which MCP cannot reattach to.
+                prerender_ready = threading.Event()
                 class Site(http.server.BaseHTTPRequestHandler):
                     def log_message(self, *_): pass
                     def do_GET(self):
-                        self.send_response(200); self.send_header("Content-Type", "text/html"); self.end_headers()
-                        self.wfile.write(b"" if self.path == "/b" else
-                            b'<script type="speculationrules">{"prerender": [{"source": "list", "urls": ["/b"]}]}</script>'
-                            b'<script>setTimeout(() => location.href = "/b", 1000)</script>')
+                        if self.path == '/prerender-ready':
+                            prerender_ready.set()
+                        if self.path == '/wait':
+                            prerender_ready.wait(10)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html")
+                        self.end_headers()
+                        if self.path == '/a':
+                            self.wfile.write(
+                                b'<script type="speculationrules">{"prerender": [{"urls": ["/b"]}]}</script>'
+                                b'<script>fetch("/wait").then(() => location.href = "/b")</script>')
+                        elif self.path == '/b':
+                            self.wfile.write(b'<script>if(document.prerendering)fetch("/prerender-ready")</script>')
                 site = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Site)
                 threading.Thread(target=site.serve_forever, daemon=True).start()
                 try:
                     devtools, page = f"http://127.0.0.1:{cdp}/json", f"http://127.0.0.1:{site.server_address[1]}"
-                    self.assertEqual(browserctl.preloaded_tabs(host), [])
+                    self.assertEqual(browserctl.window_command(host, 'check'), [])
                     with urllib.request.urlopen(urllib.request.Request(f"{devtools}/new?{page}/a", method="PUT")) as response:
                         tab = json.load(response)["id"]
                     deadline = time.monotonic() + 15
@@ -159,7 +170,8 @@ class RealIntegration(unittest.TestCase):
                             if {"id": tab, "url": f"{page}/b"} in [{"id": t["id"], "url": t["url"]} for t in json.load(response)]:
                                 break
                         time.sleep(.05)
-                    self.assertEqual(browserctl.preloaded_tabs(host), [f"{page}/b"])
+                    self.assertTrue(prerender_ready.is_set(), 'Chrome did not create the prerender required by this regression')
+                    self.assertEqual(browserctl.window_command(host, 'check'), [f"{page}/b"])
                     with urllib.request.urlopen(f"{devtools}/close/{tab}"): pass
                 finally:
                     site.shutdown()
@@ -225,49 +237,67 @@ class RealIntegration(unittest.TestCase):
                 binding_path.write_text(json.dumps(binding))
                 valid=run('agent',code='async(page)=>({title:await page.title()})')
                 self.assertIn('title',valid.stdout)
+                # Safe creation is routed into the bound window and remains under the durable task.
+                run('prepare')
+                created=json.loads(run('tab','new','data:text/html,<title>SAFE NEW TAB</title>').stdout)
+                self.assertEqual(created['windowId'],binding['windowId'])
+                controlled=run('agent',created['targetId'],code='async(page)=>{await page.getByText("missing").count(); return await page.title();}')
+                self.assertIn('SAFE NEW TAB',controlled.stdout)
+                self.assertEqual(json.loads(run('status').stdout)['state'],'READY')
                 for key,wrong,expected in [('windowId',-1,'moved to another window'),
-                        ('targetId','missing-target','Configured agent tab is missing'),
-                        ('start','wrong-start','another browser'),
-                        ('region',{'left':10000,'top':0,'width':10,'height':10},'outside its assigned region')]:
+                        ('targetId','missing-target','Selected tab is missing'),
+                        ('start','wrong-start','another Chrome process'),
+                        ('marker','unfinished-preparation','preparation is incomplete')]:
                     binding_path.write_text(json.dumps({**binding,key:wrong}))
                     failed=run('agent',code='async()=>{throw new Error("USER_CODE_EXECUTED")}',ok=False)
                     self.assertIn(expected,failed.stderr)
                 binding_path.write_text(json.dumps(binding))
-                # Exercise the actual startup JavaScript against two disposable Chrome windows.
-                tree=ast.parse(CTL.read_text())
-                startup=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='start_chrome')
-                script=next(n.value for n in ast.walk(startup) if isinstance(n,ast.Constant) and
-                            isinstance(n.value,str) and 'const {region,human,prepareOnly,previous}' in n.value)
-                def raw(code,ok=True):
-                    return run('call','browser_run_code_unsafe',json.dumps({'code':code}),ok=ok)
-                raw("""async(page)=>{
-                  const s=await page.context().browser().newBrowserCDPSession();
-                  try {return await s.send('Target.createTarget',{url:'about:blank',newWindow:true,left:850,top:0,width:800,height:600});}
-                  finally {await s.detach();}
-                }""")
-                setup={'region':{k:binding['region'][k] for k in ('left','top','width','height')},
-                       'human':{'left':850,'top':0,'width':800,'height':600},
-                       'prepareOnly':True,'previous':binding}
-                count="""async(page)=>{
-                  const s=await page.context().browser().newBrowserCDPSession();
-                  try {
-                    const windows=new Set();
-                    for(const t of (await s.send('Target.getTargets')).targetInfos.filter(t=>t.type==='page'))
-                      windows.add((await s.send('Browser.getWindowForTarget',{targetId:t.targetId})).windowId);
-                    return {windowCount:windows.size};
-                  }finally{await s.detach();}
-                }"""
-                for prepare in [True,False,True]:
-                    raw(script.replace('SETUP',json.dumps({**setup,'prepareOnly':prepare})))
-                    self.assertIn('"windowCount":2',json.loads(raw(count).stdout)['content'][0]['text'])
-                missing={**setup,'previous':None,'region':{**setup['region'],'left':9000}}
-                failed=raw(script.replace('SETUP',json.dumps(missing)),ok=False)
-                self.assertIn('no window was created',failed.stderr)
-                self.assertIn('"windowCount":2',json.loads(raw(count).stdout)['content'][0]['text'])
-                moved={**setup,'region':{**setup['region'],'left':9000}}
-                failed=raw(script.replace('SETUP',json.dumps(moved)),ok=False)
-                self.assertIn('Recorded agent window moved',failed.stderr)
-                self.assertIn('"windowCount":2',json.loads(raw(count).stdout)['content'][0]['text'])
+                # Explicit human-tab control does not depend on an agent binding.
+                binding_path.unlink()
+                explicit=run('agent',binding['targetId'],code='async(page)=>{await page.setContent("<title>EXPLICIT HUMAN TAB</title><button>test</button>");await page.getByRole("button").click();return await page.title();}')
+                self.assertIn('EXPLICIT HUMAN TAB',explicit.stdout)
+                missing=run('agent','missing-target',code='async()=>{throw new Error("WRONG_TAB")}',ok=False)
+                self.assertIn('Selected tab is missing',missing.stderr)
+                self.assertNotIn('WRONG_TAB',missing.stderr)
+                binding_path.write_text(json.dumps(binding))
+                # Window position is not identity; resized/moved windows remain valid.
+                binding_path.write_text(json.dumps({**binding,'region':{'left':10000,'top':0,'width':10,'height':10}}))
+                self.assertIn('EXPLICIT HUMAN TAB',run('agent',code='async(page)=>await page.title()').stdout)
+                run('task','end')
+                # A new task must reuse its warm attachment while another tab is loading.
+                entered, release = threading.Event(), threading.Event()
+                class LoadingPage(http.server.BaseHTTPRequestHandler):
+                    def log_message(self, *_): pass
+                    def do_GET(self):
+                        entered.set()
+                        release.wait(20)
+                        self.send_response(200)
+                        self.end_headers()
+                loading = http.server.ThreadingHTTPServer(('127.0.0.1', 0), LoadingPage)
+                threading.Thread(target=loading.serve_forever, daemon=True).start()
+                try:
+                    slow_url = f'http://127.0.0.1:{loading.server_address[1]}/loading'
+                    with urllib.request.urlopen(urllib.request.Request(f'{devtools}/new?{slow_url}', method='PUT')) as response:
+                        loading_tab = json.load(response)['id']
+                    self.assertTrue(entered.wait(3))
+                    run('task', 'begin', 'warm attachment with another tab loading')
+                    began = time.monotonic()
+                    healthy = run('agent', binding['targetId'], code='async(page)=>await page.title()')
+                    self.assertIn('EXPLICIT HUMAN TAB', healthy.stdout)
+                    self.assertLess(time.monotonic() - began, 8)
+                    run('task', 'end')
+                finally:
+                    release.set()
+                    loading.shutdown()
+                    loading.server_close()
+                    with urllib.request.urlopen(f'{devtools}/close/{loading_tab}'): pass
+                # A human can close the previously attached tab between tasks.
+                with urllib.request.urlopen(f"{devtools}/close/{binding['targetId']}"): pass
+                with urllib.request.urlopen(urllib.request.Request(f"{devtools}/new?about:blank",method="PUT")) as response:
+                    replacement=json.load(response)['id']
+                run('task','begin','attach after human closed previous tab')
+                self.assertIn('about:blank',run('agent',replacement,code='async(page)=>page.url()').stdout)
+                self.assertEqual(int(os.readlink(lock).rsplit('-',1)[1]),lock_pid)
                 run('task','end')
             finally:
                 if daemon and daemon.poll() is None:

@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "Browserctl window routing",
+  "version": "1.0",
+  "background": {
+    "service_worker": "worker.js"
+  },
+  "permissions": [
+    "storage",
+    "tabGroups"
+  ]
+}

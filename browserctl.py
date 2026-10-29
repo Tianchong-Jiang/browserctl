@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 """Small controller for one warm Playwright MCP browser session."""
-import base64, hashlib, itertools, json, math, os
+import hashlib, json, math, os
 from pathlib import Path
 import pwd, re, secrets, signal, socket, subprocess, sys, tempfile, time
 import urllib.error, urllib.parse, urllib.request
@@ -197,47 +197,14 @@ def chrome_identity(config):
     return {'pid': pid, 'start': start, 'exe': exe,
             'profile': config['profile'], 'cdp': config['cdp_endpoint']}
 
-def preloaded_tabs(config):
-    """Return URLs of tabs whose main frame was swapped in from Chrome preloading.
-
-    MCP 0.0.78 cannot attach to such a tab after reconnecting, so every tool
-    response waits for its title until the call times out.
-    """
-    port = endpoint(config['cdp_endpoint'], 'CDP')
-    with urllib.request.urlopen(f'http://127.0.0.1:{port}/json/version', timeout=HTTP_TIMEOUT) as response:
-        path = urllib.parse.urlsplit(json.load(response)['webSocketDebuggerUrl']).path
-    key = base64.b64encode(secrets.token_bytes(16)).decode()
-    with socket.create_connection(('127.0.0.1', port), HTTP_TIMEOUT) as stream, stream.makefile('rb') as reader:
-        stream.sendall(f'GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
-                       f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n'.encode())
-        require(reader.readline().split()[1:2] == [b'101'], 'CDP websocket upgrade failed')
-        while reader.readline() not in (b'\r\n', b''): pass
-        ids = itertools.count(1)
-        def send(method, params=None, session=None):
-            identifier, mask = next(ids), secrets.token_bytes(4)
-            body = json.dumps({'id': identifier, 'method': method, 'params': params or {},
-                               **({'sessionId': session} if session else {})}).encode()
-            size = bytes([128 | len(body)]) if len(body) < 126 else bytes([254]) + len(body).to_bytes(2, 'big')
-            stream.sendall(bytes([129]) + size + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(body)))
-            while True:
-                size = reader.read(2)[1] & 127
-                if size > 125: size = int.from_bytes(reader.read(2 if size == 126 else 8), 'big')
-                message = json.loads(reader.read(size))
-                if message.get('id') == identifier:
-                    require('result' in message, f'CDP {method} failed: {message}')
-                    return message['result']
-        stale = []
-        for target in send('Target.getTargets')['targetInfos']:
-            if target['type'] == 'page':
-                session = send('Target.attachToTarget', {'targetId': target['targetId'], 'flatten': True})['sessionId']
-                if send('Page.getFrameTree', session=session)['frameTree']['frame']['id'] != target['targetId']:
-                    stale.append(target['url'])
-                send('Target.detachFromTarget', {'sessionId': session})
-        return stale
-
-def require_no_preloaded_tabs(config):
-    stale = preloaded_tabs(config)
-    require(not stale, 'preloaded Chrome tabs hang Playwright; close them or restart Chrome: ' + ' '.join(stale))
+def window_command(config, mode, **kwargs):
+    result = subprocess.run([str(Path(config['npx']).with_name('node')), '--experimental-websocket',
+        str(Path(__file__).with_name('browser-window.cjs'))],
+        input=json.dumps(dict(config=config, mode=mode, bindingFile=str(
+            Path(os.getenv('XDG_CONFIG_HOME', Path.home() / '.config')) / 'browserctl/agent-window.json'), **kwargs)),
+        text=True, capture_output=True, timeout=15)
+    require(result.returncode == 0, result.stderr.strip())
+    return strict_load(result.stdout)
 
 def valid_receipt(receipt):
     keys = {'id', 'request_id', 'stdout', 'stderr', 'exit_code'}
@@ -607,6 +574,10 @@ class Daemon:
         task = self.require_ready()
         if command == 'tools':
             receipt = self.dispatch(task, rid, 'tools', self.mcp.tools)
+        elif command == 'tab_new':
+            require(len(args) == 1 and isinstance(args[0], str), 'tab new requires one URL')
+            receipt = self.dispatch(task, rid, 'tab new',
+                lambda: window_command(self.config, 'new-tab', identity=self.identity, urls=args))
         elif command == 'call':
             if len(args) != 2 or not isinstance(args[0], str) or (not args[0]) or (not isinstance(args[1], dict)):
                 fail('call requires TOOL and a JSON object')
@@ -727,7 +698,7 @@ def client(command, args, quiet=False):
         if not response['ok']:
             fail(response['error'])
         value = response['value']
-        if command in {'tools', 'call', 'result'}:
+        if command in {'tools', 'call', 'tab_new', 'result'}:
             if not quiet:
                 sys.stdout.write(value['stdout'])
                 sys.stderr.write(value['stderr'])
@@ -801,136 +772,78 @@ SIMPLE_CLI = {
     ('task', 'end'): ('task_end', []), ('tools',): ('tools', []),
     ('result',): ('result', [])}
 
-def agent_cli(code):
+def agent_cli(code, target=None):
     config = load_config()
     identity = chrome_identity(config)
-    binding = read_json(Path(os.getenv('XDG_CONFIG_HOME', Path.home() / '.config')) /
-                        'browserctl/agent-window.json', 'agent window binding')
-    require(binding['pid'] == identity['pid'] and binding['start'] == identity['start'],
-            'agent window binding belongs to another browser; run startup setup')
-    require_no_preloaded_tabs(config)
+    binding = {'targetId': target} if target else read_json(
+        Path(os.getenv('XDG_CONFIG_HOME', Path.home() / '.config')) /
+        'browserctl/agent-window.json', 'agent window binding')
+    require(target or (binding['pid'], binding['start']) == (identity['pid'], identity['start']),
+            'agent window belongs to another Chrome process; run prepare')
+    require(not binding.get('marker'), 'agent preparation is incomplete; run prepare')
+    stale = window_command(config, 'check')
+    require(not stale, 'preloaded Chrome tabs hang Playwright: ' + ' '.join(stale))
     require(code.strip(), 'agent expects an async function on stdin')
     wrapper = """async (rootPage) => {
       const binding = BINDING;
       for (const page of rootPage.context().pages()) {
         const session = await page.context().newCDPSession(page);
         try {
-          const {targetInfo} = await session.send('Target.getTargetInfo');
-          if (targetInfo.targetId !== binding.targetId) continue;
-          const window = await session.send('Browser.getWindowForTarget', {targetId: targetInfo.targetId});
-          if (window.windowId !== binding.windowId) throw new Error('Agent tab moved to another window');
-          const b = window.bounds, r = binding.region;
-          if (b.windowState !== 'normal' || b.left < r.left - 8 || b.top < r.top - 8 ||
-              b.left + b.width > r.left + r.width + 8 || b.top + b.height > r.top + r.height + 8)
-            throw new Error('Agent window is outside its assigned region');
+          if ((await session.send('Target.getTargetInfo')).targetInfo.targetId !== binding.targetId) continue;
+          const window = await session.send('Browser.getWindowForTarget', {targetId: binding.targetId});
+          if (binding.windowId && window.windowId !== binding.windowId) throw new Error('Agent tab moved to another window');
           await session.send('Emulation.setFocusEmulationEnabled', {enabled: true});
           try { return await (CODE)(page); }
           finally { await session.send('Emulation.setFocusEmulationEnabled', {enabled: false}); }
         } finally { await session.detach(); }
       }
-      throw new Error('Configured agent tab is missing; run startup setup');
+      throw new Error('Selected tab is missing; list tabs or prepare the agent window');
     }""".replace('BINDING', json.dumps(binding)).replace('CODE', code)
     return client('call', ['browser_run_code_unsafe', {'code': wrapper}])
 
-def start_chrome(argv):
-    if any(x.startswith('--') and x != '--prepare-only' for x in argv):
-        raise Error('Unsupported startup option; use the native Chrome action for private browsing')
+def prepare_agent():
     config = load_config()
-    if '--prepare-only' not in argv:
+    identity = chrome_identity(config)
+    print(json.dumps(window_command(config, 'agent', identity=identity)))
+
+def start_chrome(argv):
+    if argv == ['--prepare-only']:
+        return prepare_agent()
+    new_window = '--new-window' in argv
+    argv = [value for value in argv if value != '--new-window']
+    require(not any(value.startswith('--') for value in argv), 'Unsupported startup option')
+    config = load_config()
+    urls = [value if urllib.parse.urlsplit(value).scheme else Path(value).absolute().as_uri() for value in argv]
+    lock = Path(config['profile']) / 'SingletonLock'
+    if lock.is_symlink() and Path('/proc/' + os.readlink(lock).rsplit('-', 1)[-1]).exists():
+        identity = chrome_identity(config)
+        print(json.dumps(window_command(config, 'human', identity=identity, urls=urls, newWindow=new_window)))
+        return
+    with (state_dir() / 'chrome-launch.log').open('ab') as log:
         subprocess.Popen([config['chrome_exe'], '--user-data-dir=' + config['profile'],
-            '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=' + str(endpoint(config['cdp_endpoint'], 'CDP')),
-            '--no-first-run', '--no-default-browser-check', '--no-startup-window'],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True)
-    for attempt in range(40):
-        try:
-            identity = chrome_identity(config)
-            break
-        except Error:
-            if attempt == 39: raise
-            time.sleep(0.25)
-    require_no_preloaded_tabs(config)
-    subprocess.run(['systemctl', '--user', 'start', 'browserctl-controller.service'], check=True)
-    client('task_begin', ['chrome-startup'], True)
-    try:
-        target = Path(os.getenv('XDG_CONFIG_HOME', Path.home()/'.config')) / 'browserctl/agent-window.json'
-        previous = read_json(target, 'agent window binding') if target.exists() else None
-        if previous and (previous['pid'], previous['start']) != (identity['pid'], identity['start']):
-            previous = None
-        code = '''async(page)=>{
-          const {region,human,prepareOnly,previous}=SETUP;
-          const session=await page.context().browser().newBrowserCDPSession();
-          try {
-            const targets=(await session.send('Target.getTargets')).targetInfos.filter(t=>t.type==='page');
-            const windows=new Map(), matches=[];
-            let bound;
-            for(const t of targets){
-              let w;
-              try {w=await session.send('Browser.getWindowForTarget',{targetId:t.targetId});}
-              catch(e){if(String(e).includes('Browser window not found'))continue;throw e;}
-              const item={targetId:t.targetId,windowId:w.windowId,bounds:w.bounds};
-              windows.set(w.windowId,item);
-              if(previous && t.targetId===previous.targetId && w.windowId===previous.windowId)bound=item;
-              if(w.bounds.windowState==='normal' && Object.keys(region).every(k=>Math.abs(w.bounds[k]-region[k])<8))
-                matches.push(item);
-            }
-            if(new Set(matches.map(x=>x.windowId)).size>1)throw new Error('Multiple windows occupy the agent region');
-            if(windows.size>2)throw new Error('Expected only human and agent Chrome windows');
-            if(bound && !matches.some(t=>t.targetId===bound.targetId))throw new Error('Recorded agent window moved; restore its configured bounds');
-            let agent=bound || matches[0];
-            if(!agent){
-              if(windows.size>=2)throw new Error('Two Chrome windows exist but agent identification failed; no window was created');
-              const {targetId}=await session.send('Target.createTarget',{url:'about:blank',newWindow:true,background:true,focus:false,...region});
-              const w=await session.send('Browser.getWindowForTarget',{targetId});
-              agent={targetId,windowId:w.windowId};
-            }
-            const personal=[...windows.values()].find(w=>w.windowId!==agent.windowId);
-            if(!prepareOnly){
-              if(personal)await session.send('Target.activateTarget',{targetId:personal.targetId});
-              else await session.send('Target.createTarget',{url:'https://mail.google.com/mail/u/0/',newWindow:true,background:false,focus:true,...human});
-            }
-            return agent;
-          } finally {await session.detach();}
-        }'''
-        code = code.replace('SETUP', json.dumps({'prepareOnly': '--prepare-only' in argv, 'previous': previous,
-            'region': config['agent_region'], 'human': config['human_region']}))
-        result = client('call', ['browser_run_code_unsafe', {'code': code}], True)
-        text = next(c['text'] for c in result['content'] if c.get('text', '').startswith('### Result\n'))
-        binding = json.loads(text.split('### Result\n', 1)[1].split('\n### ', 1)[0])
-        if config['hostname'] == 'laptop':
-            import gi
-            gi.require_version('Wnck', '3.0')
-            from gi.repository import Wnck
-            screen = Wnck.Screen.get_default()
-            region = config['agent_region']
-            for attempt in range(40):
-                screen.force_update()
-                windows = [w for w in screen.get_windows() if w.get_pid() == identity['pid'] and
-                           tuple(w.get_client_window_geometry()) == tuple(region[k] for k in ('left', 'top', 'width', 'height'))]
-                if len(windows) == 1:
-                    break
-                time.sleep(.05)
-            require(len(windows) == 1, 'Cannot identify the native agent window for desktop placement')
-            windows[0].move_to_workspace(screen.get_workspace(1))
-        binding.update(pid=identity['pid'], start=identity['start'], region=config['agent_region'])
-        temporary = target.with_suffix('.tmp')
-        temporary.write_text(json.dumps(binding, indent=2)+'\n'); temporary.chmod(0o600)
-        temporary.replace(target)
-        if argv and '--prepare-only' not in argv:
-            subprocess.Popen([config['chrome_exe'], '--user-data-dir='+config['profile'], *argv],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(json.dumps({'ready': True, **binding}))
-    finally:
-        status = client('status', [], True)
-        if status['owner'] == 'chrome-startup' and status['state'] == 'READY':
-            client('task_end', [], True)
+            '--remote-debugging-address=127.0.0.1',
+            '--remote-debugging-port=' + str(endpoint(config['cdp_endpoint'], 'CDP')),
+            '--no-first-run', '--no-default-browser-check', '--new-window',
+            *(['--start-maximized'] if config['hostname'] == 'laptop' else []), *urls],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    print(json.dumps({'launched': True}))
 
 def parse_cli(argv):
     if argv and argv[0] == 'start':
         start_chrome(argv[1:])
         return 0
-    if argv == ['agent']:
-        return agent_cli(sys.stdin.read())
+    if len(argv) in (2, 3) and argv[:2] == ['tab', 'new']:
+        return client('tab_new', [argv[2] if len(argv) == 3 else 'about:blank'])
+    if len(argv) in (1, 2) and argv[0] == 'agent':
+        return agent_cli(sys.stdin.read(), argv[1] if len(argv) == 2 else None)
+    if argv == ['prepare']:
+        prepare_agent()
+        return 0
+    if argv == ['tabs']:
+        config = load_config()
+        chrome_identity(config)
+        print(json.dumps(window_command(config, 'tabs')))
+        return 0
     if argv == ['daemon']:
         Daemon().serve()
         return 0
@@ -940,6 +853,7 @@ def parse_cli(argv):
     if tuple(argv) in SIMPLE_CLI:
         return client(*SIMPLE_CLI[tuple(argv)])
     if len(argv) == 3 and argv[:2] == ['task', 'begin']:
+        subprocess.run(['systemctl', '--user', 'start', 'browserctl-controller.service'], check=True, stdout=subprocess.DEVNULL)
         return client('task_begin', [argv[2]])
     if len(argv) == 3 and argv[0] == 'call':
         arguments = strict_load(argv[2], 'tool arguments')
@@ -948,13 +862,13 @@ def parse_cli(argv):
         return client('call', [argv[1], arguments])
     fail(
         'usage: browserctl.py doctor|status|task begin OWNER|task recover|'
-        'task end|start [--prepare-only|URL...]|tools|'
-        'agent < FUNCTION.js|call TOOL JSON|result')
+        'task end|start [--prepare-only|--new-window|URL...]|tools|tab new [URL]|'
+        'prepare|tabs|agent [TARGET_ID] < FUNCTION.js|call TOOL JSON|result')
 if __name__ == '__main__':
     try:
         raise SystemExit(parse_cli(sys.argv[1:]))
     except KeyboardInterrupt:
         raise SystemExit(0)
-    except (Error, subprocess.CalledProcessError) as exc:
+    except (Error, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         print(f'browserctl: {exc}', file=sys.stderr)
         raise SystemExit(1)
